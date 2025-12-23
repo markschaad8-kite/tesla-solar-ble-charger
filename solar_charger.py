@@ -349,7 +349,7 @@ def wake_vehicle_safe():
                 return False
 
             vehicle = vehicles[0]
-            log("MANUAL escalation: sending Tesla API wake...")
+            log("Escalation: sending Tesla API wake...")
             vehicle.sync_wake_up()
             state.last_wake_attempt = now
             log("Wake request sent successfully")
@@ -883,6 +883,16 @@ def main():
         # 7) SOLAR MODE
         # ========================================
         mode = 'SOLAR'
+
+        # [NEW] High Solar Wake-Up
+        # If we have strong sustained solar excess but the car is not charging,
+        # it may be in deep sleep. Wake once (cooldown protected) to allow BLE charging.
+        if excess_smooth > 1000 and charging_state != 'Charging' and twc_state is True:
+            if wake_vehicle_safe():
+                log(
+                    f"WAKE_SOLAR excess_smooth={int(excess_smooth)}W "
+                    f"battery={battery}% charging_state={charging_state}"
+                )
 
         raw_target = calculate_target_amps(excess_smooth)
         banded_target = (raw_target // AMP_STABILITY_BAND) * AMP_STABILITY_BAND
