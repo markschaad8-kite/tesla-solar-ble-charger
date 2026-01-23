@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
 ================================================================================
+Solar Charger - v4.0.6 - MANUAL mode immediate wake on first BLE fail if vehicle asleep
+Solar Charger - v4.0.5 - BLE Relay support (Pi Zero proxy for improved range)
+Solar Charger - v4.0.4 - Separate MANUAL/SOLAR wake cooldowns + SOLAR wake requires BLE failures
+Solar Charger - v4.0.3 - Added escape hatch in night mode for BLE commands no infinite loops
+Solar Charger - v4.0.2 - Added excess solar api wake command if not charging and TWC connected
 Solar Charger — v4.0.1 - Restored explicit TWC edge semantics + session lifecycle guarantees
-Stage 1 Structural Refactor + restored edge-case semantics from v3.6.8
 ================================================================================
 
 WHY v4.0.0 EXISTS
@@ -20,9 +24,46 @@ and prepares the codebase for future feature work (e.g. SOLAR-mode wake escalati
 without increasing regression risk.
 
 ================================================================================
+HISTORICAL CHANGELOG (PRESERVED VERBATIM)
+================================================================================
+
+V3.6.9 solar_charger - Emergency mode TWC verification and reassert
+- BUG FIX: Emergency mode could believe 48A was set while actual charging was limited
+  (e.g. 6A)
+  - Root cause: BLE commands are write-only; no verification loop existed
+- FEATURE: Emergency mode now verifies actual charging current via TWC monitor
+  - Reads real vehicle current (amps) from TWC API
+  - Detects mismatch between commanded amps and actual current
+  - Re-asserts MAX_AMPS when TWC shows sustained low current
+- SAFETY: Emergency mode uses TWC current only for verification, not exit decisions
+- ARCHITECTURE: Emergency TWC verification updates local control state only
+
+Solar Charger - BLE Edition v3.6.8 (AWAY Night Tracking + BLE Alert Dashboard)
+- FEATURE: AWAY mode night tracking
+- FEATURE: BLE alert dashboard
+- FIX: Skip BLE when no solar excess
+
+Solar Charger - BLE Edition v3.6.7 (Emergency Exit Fix + Observability)
+- BUG FIX: Emergency exit dead code fixed
+- FEATURE: Battery age indicator
+- FEATURE: Emergency telemetry refresh every 60s
+- FEATURE: SOLAR mode TWC drift detection
+- FEATURE: Session summary logging
+
+Solar Charger - BLE Edition v3.6.6 / v3.6.5 / v3.6.4
+- Emergency priority fixes
+- Hybrid emergency exit
+- BLE backoff cap
+- Night freshness checks
+- Wake escalation safeguards
+- Multiple BLE sequencing fixes
+
+(Full original changelog intentionally retained)
+
+================================================================================
 """
 
-VERSION = "v4.0.1"
+VERSION = "v4.0.6"
 
 import time
 import math
@@ -36,66 +77,68 @@ from typing import Optional, Deque, Dict, Any
 
 
 # -------------------------------
-# CONFIG (USER EDITABLE)
+# CONFIG - UPDATE THESE FOR YOUR SETUP
 # -------------------------------
-# --- PERSONAL VEHICLE DATA ---
 VIN = "YOUR_VIN_HERE"               # <--- UPDATE THIS
+KEY_FILE = "/app/private.pem"
+CACHE_FILE = "/app/cache.json"
 TESLA_EMAIL = "your_email@example.com"  # <--- UPDATE THIS
 
-# --- FILE PATHS (Container defaults) ---
-KEY_FILE = "/app/private.pem"       # Path to your private key inside container
-CACHE_FILE = "/app/cache.json"      # Path to your token cache inside container
+# -------------------------------
+# NETWORK CONFIG (Stage 1 migration prep)
+# -------------------------------
+SOLAR_API_BASE = os.getenv(
+    "SOLAR_API_BASE",
+    "http://YOUR_SOLAR_PI_IP"  # <--- UPDATE THIS (e.g., http://192.168.1.100)
+)
 
-# --- NETWORK CONFIG ---
-# IP address of the device hosting the Solar API and TWC Monitor
-LOCAL_SERVER_IP = "192.168.1.XXX"   # <--- UPDATE THIS
+PI2_SOLAR_URL = f"{SOLAR_API_BASE}:8080/api/envoy_data"
+PI2_CONFIG_URL = f"{SOLAR_API_BASE}:8080/api/charging/config"
+PI2_STATUS_URL = f"{SOLAR_API_BASE}:8080/api/set_charger_status"
+TWC_MONITOR_URL = f"{SOLAR_API_BASE}:5002/api/twc/vehicle_connected"
 
-# URLs for local services
-# Assumes Envoy/Solar data is on port 8080 and TWC Monitor on port 5002
-SOLAR_DATA_URL = f"http://{LOCAL_SERVER_IP}:8080/api/envoy_data"
-CONFIG_URL = f"http://{LOCAL_SERVER_IP}:8080/api/charging/config"
-STATUS_URL = f"http://{LOCAL_SERVER_IP}:8080/api/set_charger_status"
-TWC_MONITOR_URL = f"http://{LOCAL_SERVER_IP}:5002/api/twc/vehicle_connected"
+# -------------------------------
+# BLE RELAY CONFIG (Pi Zero proxy)
+# -------------------------------
+BLE_RELAY_ENABLED = os.getenv("BLE_RELAY_ENABLED", "true").lower() == "true"
+BLE_RELAY_HOST = os.getenv("BLE_RELAY_HOST", "SolarPiZero")
+BLE_RELAY_PORT = int(os.getenv("BLE_RELAY_PORT", "5003"))
+BLE_RELAY_URL = f"http://{BLE_RELAY_HOST}:{BLE_RELAY_PORT}"
 
-# --- TWC SETTINGS ---
 TWC_CACHE_TTL = 15
 TWC_STALE_THRESHOLD = 90
 
-# --- LOCATION (For Home Detection) ---
-HOME_LAT = 0.0000                   # <--- UPDATE THIS (Latitude)
-HOME_LON = 0.0000                   # <--- UPDATE THIS (Longitude)
+HOME_LAT = 0.0000                   # <--- UPDATE THIS (your latitude)
+HOME_LON = 0.0000                   # <--- UPDATE THIS (your longitude)
 HOME_RADIUS_MILES = 0.25
 
-# --- CHARGING PARAMETERS ---
 VOLTAGE = 240
 MIN_SOLAR_PRODUCTION = 100
 MIN_AMPS = 6
-MAX_AMPS = 48                       # <-----UPDATE TO YOUR HOME CHARGER SPECS
-BATTERY_EMERGENCY = 50              # Charge immediately if below this %
-BATTERY_TARGET = 80                 # Normal daily limit
+MAX_AMPS = 48
+BATTERY_EMERGENCY = 50
+BATTERY_TARGET = 80
 
-# --- TIMING & LOGIC ---
 LOOP_INTERVAL = 30
 STATUS_CHECK_INTERVAL = 300
 CACHE_TTL = 600
 
 AMP_CHANGE_THRESHOLD = 2
-AMP_STABILITY_COUNT = 2
-AMP_STABILITY_BAND = 3
-SMOOTH_WINDOW = 4
-SUSTAINED_NIGHT_SEC = 600           # Time to wait before entering NIGHT mode
+AMP_STABILITY_COUNT = 1
+AMP_STABILITY_BAND = 2
+SMOOTH_WINDOW = 3
+SUSTAINED_NIGHT_SEC = 600
 
-# --- BLE GATING ---
 BLE_COOLDOWN = 12
 BLE_BACKOFF_INITIAL = 60
 BLE_MAX_BACKOFF = 3600
 
 # Wake escalation (MANUAL mode only)
-WAKE_COOLDOWN_SEC = 900             # 15 minutes
+WAKE_COOLDOWN_SEC = 900       # 15 minutes
 BLE_FAILS_BEFORE_WAKE = 3
 
 # Hybrid emergency fallback runtime
-MAX_EMERGENCY_RUNTIME = 90 * 60     # 90 minutes
+MAX_EMERGENCY_RUNTIME = 90 * 60  # 90 minutes
 
 # Emergency mode uses more aggressive telemetry refresh (60s vs normal 300s)
 EMERGENCY_STATUS_INTERVAL = 60
@@ -112,6 +155,7 @@ class ChargerState:
     cached_battery: Optional[int] = None
     cached_is_home: Optional[bool] = None
     cached_charging_state: Optional[str] = None
+    cached_vehicle_online: bool = True
     cached_ts: float = 0.0
     last_status_check: float = 0.0
 
@@ -139,9 +183,11 @@ class ChargerState:
     # TWC disconnect tracking for amp reset
     last_twc_state: Optional[bool] = None
 
-    # Wake escalation state (MANUAL only)
+    # Wake escalation state
     manual_ble_fails: int = 0
-    last_wake_attempt: float = 0.0
+    solar_ble_fails: int = 0
+    last_wake_attempt_manual: float = 0.0
+    last_wake_attempt_solar: float = 0.0
 
     # Emergency tracking
     emergency_start_ts: Optional[float] = None
@@ -154,6 +200,8 @@ class ChargerState:
     pending_disconnect_amp_normalization: bool = False
     pending_disconnect_reason: Optional[str] = None
 
+    # --- v4.0.3: Dashboard warning flags ---
+    grid_charge_warning_amps: Optional[float] = None
 
 state = ChargerState()
 
@@ -164,9 +212,9 @@ def auth_cache_status(cache_path: str) -> str:
     try:
         with open(cache_path, "r", encoding="utf-8") as f:
             data = f.read()
-            if '"access_token"' in data and '"refresh_token"' in data:
-                return "OK (tokens present)"
-            return "MISSING TOKENS"
+        if '"access_token"' in data and '"refresh_token"' in data:
+            return "OK (tokens present)"
+        return "MISSING TOKENS"
     except Exception as e:
         return f"ERROR reading cache ({type(e).__name__}: {e})"
 
@@ -211,7 +259,7 @@ def get_twc_connected_safe():
                 log("TWC: Vehicle CONNECTED (plug detected)")
             else:
                 log("TWC: Vehicle DISCONNECTED (plug removed)")
-        state.twc_cache['last_logged_state'] = connected
+            state.twc_cache['last_logged_state'] = connected
         state.twc_cache['value'] = connected
         state.twc_cache['ts'] = now
         return connected
@@ -241,7 +289,7 @@ def get_twc_current_amps():
 # -------------------------------
 def get_solar_data():
     try:
-        r = requests.get(SOLAR_DATA_URL, timeout=30)  # Verified: 30s timeout
+        r = requests.get(PI2_SOLAR_URL, timeout=30)  # Verified: 30s timeout
         data = r.json()
         production = float(data.get('production_watts', 0) or 0)
         excess = float(data.get('excess_watts', 0) or 0)
@@ -253,7 +301,7 @@ def get_solar_data():
 
 def get_charging_config():
     try:
-        r = requests.get(CONFIG_URL, timeout=4)
+        r = requests.get(PI2_CONFIG_URL, timeout=4)
         return r.json().get('mode', 'SOLAR')
     except:
         return 'SOLAR'
@@ -274,9 +322,10 @@ def update_dashboard_status(mode, amps, target_amps, battery, excess_watts, prod
             'timestamp': datetime.now().isoformat(),
             'ble_fail_count': state.ble_fail_count,
             'ble_backoff_until': state.ble_backoff_until,
-            'ble_backoff_remaining': max(0, int(state.ble_backoff_until - time.time()))
+            'ble_backoff_remaining': max(0, int(state.ble_backoff_until - time.time())),
+            'grid_charge_warning_amps': state.grid_charge_warning_amps
         }
-        requests.post(STATUS_URL, json=payload, timeout=3)
+        requests.post(PI2_STATUS_URL, json=payload, timeout=3)
     except Exception as e:
         log(f"ERROR updating dashboard: {e}")
 
@@ -290,7 +339,7 @@ def get_tesla_status():
         return state.cached_battery, state.cached_is_home, state.cached_charging_state
     try:
         import teslapy
-        with teslapy.Tesla(TESLA_EMAIL, cache_file=CACHE_FILE) as tesla:
+        with teslapy.Tesla(TESLA_EMAIL, cache_file='/app/cache.json') as tesla:
             vehicles = tesla.vehicle_list()
             if not vehicles:
                 log("No vehicles found (teslapy)")
@@ -298,6 +347,7 @@ def get_tesla_status():
             vehicle = vehicles[0]
             if vehicle['state'] != 'online':
                 log(f"Vehicle {vehicle['state']} - using cache")
+                state.cached_vehicle_online = False
                 return state.cached_battery, state.cached_is_home, state.cached_charging_state
             data = vehicle.get_vehicle_data()
             lat = data['drive_state'].get('latitude')
@@ -314,6 +364,7 @@ def get_tesla_status():
             state.cached_battery = battery
             state.cached_is_home = is_home
             state.cached_charging_state = charging
+            state.cached_vehicle_online = True
             state.cached_ts = now
             state.last_status_check = now
 
@@ -327,16 +378,23 @@ def get_tesla_status():
 # -------------------------------
 # Wake escalation (MANUAL only)
 # -------------------------------
-def wake_vehicle_safe():
+def wake_vehicle_safe(reason: str = 'manual'):
     """
     Wake car via Tesla API with cooldown.
-    Only called from MANUAL mode escalation.
+    Supports separate cooldowns for MANUAL vs SOLAR escalation.
     Returns True if wake was attempted, False if skipped/failed.
     """
     now = time.time()
-    remaining = WAKE_COOLDOWN_SEC - (now - state.last_wake_attempt)
+    
+    # Select appropriate cooldown based on reason
+    if reason == 'solar':
+        last_attempt = state.last_wake_attempt_solar
+    else:
+        last_attempt = state.last_wake_attempt_manual
+    
+    remaining = WAKE_COOLDOWN_SEC - (now - last_attempt)
     if remaining > 0:
-        log(f"Wake skipped (cooldown {int(remaining)}s remaining)")
+        log(f"Wake skipped [{reason}] (cooldown {int(remaining)}s remaining)")
         return False
 
     try:
@@ -344,21 +402,34 @@ def wake_vehicle_safe():
         with teslapy.Tesla(TESLA_EMAIL) as tesla:
             vehicles = tesla.vehicle_list()
             if not vehicles:
-                log("Wake failed: no vehicles found")
-                state.last_wake_attempt = now  # Set cooldown anyway
+                log(f"Wake failed [{reason}]: no vehicles found")
+                # Set cooldown for this reason
+                if reason == 'solar':
+                    state.last_wake_attempt_solar = now
+                else:
+                    state.last_wake_attempt_manual = now
                 return False
 
             vehicle = vehicles[0]
-            log("Escalation: sending Tesla API wake...")
+            log(f"Escalation [{reason}]: sending Tesla API wake...")
             vehicle.sync_wake_up()
-            state.last_wake_attempt = now
+            
+            # Set cooldown for this reason
+            if reason == 'solar':
+                state.last_wake_attempt_solar = now
+            else:
+                state.last_wake_attempt_manual = now
+            
             log("Wake request sent successfully")
             return True
     except Exception as e:
-        log(f"Wake failed: {e}")
-        state.last_wake_attempt = now  # Set cooldown to prevent spam on repeated failures
+        log(f"Wake failed [{reason}]: {e}")
+        # Set cooldown for this reason
+        if reason == 'solar':
+            state.last_wake_attempt_solar = now
+        else:
+            state.last_wake_attempt_manual = now
         return False
-
 
 # -------------------------------
 # BLE helpers
@@ -376,12 +447,87 @@ def ble_allowed():
 
 
 def run_tesla_control(cmd):
+    """Execute tesla-control command, either via BLE relay or locally."""
+    if BLE_RELAY_ENABLED:
+        return run_tesla_control_via_relay(cmd)
+    else:
+        return run_tesla_control_local(cmd)
+
+
+def run_tesla_control_local(cmd):
+    """Original local BLE execution (fallback if relay disabled)."""
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         out = (r.stdout + r.stderr).lower()
         return r.returncode == 0, out
     except Exception as e:
         return False, str(e)
+
+
+def run_tesla_control_via_relay(cmd):
+    """
+    Execute tesla-control via Pi Zero BLE relay.
+
+    The cmd list looks like:
+    ['tesla-control', '-ble', '-key-file', '/app/private.pem', '-vin', 'XXX', 'charging-set-amps', '20']
+
+    We extract the command and args, send to relay.
+    """
+    try:
+        # Parse the command list to extract the actual command and args
+        # Skip the tesla-control binary and standard flags
+        command = None
+        args = []
+        skip_next = False
+
+        for i, part in enumerate(cmd):
+            if skip_next:
+                skip_next = False
+                continue
+
+            # Skip the binary name
+            if part == 'tesla-control' or part.endswith('tesla-control'):
+                continue
+
+            # Skip flags and their values
+            if part in ['-ble', '-debug']:
+                continue
+            if part in ['-key-file', '-vin', '-key-name']:
+                skip_next = True  # Skip the next value too
+                continue
+
+            # This must be the command or an arg
+            if command is None:
+                command = part
+            else:
+                args.append(part)
+
+        if not command:
+            return False, "could not parse command from cmd list"
+
+        # Send to relay
+        response = requests.post(
+            f"{BLE_RELAY_URL}/ble/command",
+            json={'command': command, 'args': args},
+            timeout=60  # Allow for BLE timeout + network
+        )
+
+        data = response.json()
+        success = data.get('success', False)
+        output = data.get('output', '')
+        duration = data.get('duration', 0)
+
+        # Log relay usage
+        log(f"BLE relay: {command} {' '.join(str(a) for a in args)} -> {'OK' if success else 'FAILED'} ({duration:.1f}s)")
+
+        return success, output.lower()
+
+    except requests.exceptions.Timeout:
+        return False, "relay timeout"
+    except requests.exceptions.ConnectionError:
+        return False, "relay connection failed - pi zero unreachable"
+    except Exception as e:
+        return False, f"relay error: {str(e)}"
 
 
 def log_ble_failure_context():
@@ -527,7 +673,9 @@ def main():
     log("=" * 60)
     log(f"SOLAR CHARGER {VERSION} (Stage 1 Refactor: state object)")
     log("=" * 60)
-    log(f"TWC Monitor: {TWC_MONITOR_URL}")
+    log(f"SOLAR_API_BASE resolved to: {SOLAR_API_BASE}")
+    log(f"Solar API: {PI2_SOLAR_URL}")
+    log(f"TWC Monitor API: {TWC_MONITOR_URL}")
     log(f"Loop interval: {LOOP_INTERVAL}s")
     log(f"BLE_COOLDOWN: {BLE_COOLDOWN}s, BLE_BACKOFF: {BLE_BACKOFF_INITIAL}s, MAX: {BLE_MAX_BACKOFF}s")
     log(f"Wake escalation: after {BLE_FAILS_BEFORE_WAKE} fails, cooldown {WAKE_COOLDOWN_SEC}s")
@@ -549,6 +697,7 @@ def main():
         loop_count += 1
         state.ble_command_this_loop = False
         state.ble_attempted_this_loop = False
+        state.grid_charge_warning_amps = None  # Reset each loop, set if detected
         mode = "UNKNOWN"
         log(f"\n--- Loop {loop_count} ---")
 
@@ -584,11 +733,12 @@ def main():
             state.ble_fail_count = 0
             state.ble_backoff_until = 0.0
             state.emergency_start_ts = None
-
+        
         if state.last_twc_state is False and twc_state is True:
             state.session_start_ts = time.time()
             state.session_peak_amps = 0
             log("📊 SESSION STARTED: tracking begins")
+            log(f"🔋 New session: resetting BLE + emergency state")
 
             # One-time retry of disconnect normalization if needed
             if state.pending_disconnect_amp_normalization:
@@ -602,8 +752,8 @@ def main():
                 else:
                     log("  └─ Pending normalize retry gated")
 
-            state.pending_disconnect_amp_normalization = False
-            state.pending_disconnect_reason = None
+                state.pending_disconnect_amp_normalization = False
+                state.pending_disconnect_reason = None
 
         state.last_twc_state = twc_state
 
@@ -637,7 +787,7 @@ def main():
                 else:
                     if state.last_low_prod_time is not None:
                         log("AWAY: Production recovered, night timer reset")
-                        state.last_low_prod_time = None
+                    state.last_low_prod_time = None
 
             update_dashboard_status("AWAY", 0, 0, state.cached_battery, excess_val, prod_smooth, 'Disconnected')
             time.sleep(LOOP_INTERVAL)
@@ -684,8 +834,8 @@ def main():
             now_ts = time.time()
             if (now_ts - state.last_status_check) >= STATUS_CHECK_INTERVAL:
                 battery, is_home, charging_state = get_tesla_status()
-                battery = state.cached_battery or 50
-                charging_state = state.cached_charging_state
+            battery = state.cached_battery or 50
+            charging_state = state.cached_charging_state
 
             log(f"MODE: MANUAL - Charging at MAX to {BATTERY_TARGET}%")
 
@@ -705,9 +855,19 @@ def main():
                 state.manual_ble_fails += 1
                 log(f"MANUAL BLE fail streak: {state.manual_ble_fails}")
 
+                # Fast wake: first fail + vehicle asleep = wake immediately and retry
+                if state.manual_ble_fails == 1 and not state.cached_vehicle_online:
+                    log("MANUAL: Vehicle asleep -> immediate wake + retry")
+                    if wake_vehicle_safe('manual'):
+                        time.sleep(20)  # Wait for car to fully wake (BLE takes longer than API)
+                        state.ble_command_this_loop = False
+                        state.ble_backoff_until = 0
+                        if set_charging_amps(MAX_AMPS):
+                            state.manual_ble_fails = 0
+
             if twc_state is True and state.manual_ble_fails >= BLE_FAILS_BEFORE_WAKE:
                 log(f"MANUAL: BLE failed {state.manual_ble_fails}x while connected - escalating to API wake")
-                wake_vehicle_safe()
+                wake_vehicle_safe('manual')
                 log("MANUAL wake escalation attempted; resetting BLE failure counters")
                 state.manual_ble_fails = 0
                 state.ble_fail_count = 0
@@ -751,9 +911,9 @@ def main():
                 battery = state.cached_battery or 50
                 charging_state = state.cached_charging_state
 
-            if battery >= BATTERY_EMERGENCY:
-                log(f"EMERGENCY: battery recovered to {battery}% (>= {BATTERY_EMERGENCY}%) -> exiting emergency")
-                state.emergency_start_ts = None
+                if battery >= BATTERY_EMERGENCY:
+                    log(f"EMERGENCY: battery recovered to {battery}% (>= {BATTERY_EMERGENCY}%) -> exiting emergency")
+                    state.emergency_start_ts = None
 
             if state.emergency_start_ts is not None:
                 if elapsed >= MAX_EMERGENCY_RUNTIME:
@@ -786,11 +946,11 @@ def main():
                         if state.current_amps == MAX_AMPS and state.cached_charging_state == 'Charging' and twc_amps < (MAX_AMPS - 5):
                             log(f"⚠️ EMERGENCY: TWC shows {twc_amps:.1f}A but expected ~{MAX_AMPS}A. Will re-assert 48A/start on next allowed loop.")
 
-                        if twc_amps is not None and twc_amps < (MAX_AMPS - 5):
-                            if ble_allowed() and not state.ble_command_this_loop:
-                                set_charging_amps(MAX_AMPS)
-                            elif not ble_allowed():
-                                log("EMERGENCY: TWC amps low but BLE gated; will retry next loop")
+                    if twc_amps is not None and twc_amps < (MAX_AMPS - 5):
+                        if ble_allowed() and not state.ble_command_this_loop:
+                            set_charging_amps(MAX_AMPS)
+                        elif not ble_allowed():
+                            log("EMERGENCY: TWC amps low but BLE gated; will retry next loop")
 
                     solar = get_solar_data()
                     if solar:
@@ -835,28 +995,44 @@ def main():
                 if not state.night_stop_sent:
                     log(f"Night mode: production below {MIN_SOLAR_PRODUCTION}W for {SUSTAINED_NIGHT_SEC}s")
 
-                    state_age = now_ts - state.last_status_check if state.last_status_check else 9999
-                    charging_state_fresh = state_age < STATUS_CHECK_INTERVAL * 1.5
-
-                    if charging_state_fresh and state.cached_charging_state != 'Charging':
-                        log("Night stop: car already not charging (fresh data)")
+                    # ESCAPE HATCH 1: TWC shows no current = not charging = done
+                    twc_amps = get_twc_current_amps()
+                    if twc_amps is not None and twc_amps < 0.5:
+                        log(f"Night stop: TWC shows {twc_amps:.1f}A (no current) - marking complete")
                         state.night_stop_sent = True
-                    elif ble_allowed():
-                        if stop_charging():
-                            log("Night stop: BLE stop succeeded")
-                            state.night_stop_sent = True
-                        else:
-                            log("Night stop: BLE stop failed; will retry next loop")
+
+                    # ESCAPE HATCH 2: Already at 0A = not charging = done
+                    elif state.current_amps == 0:
+                        log("Night stop: Already at 0A - marking complete")
+                        state.night_stop_sent = True
+
+                    # ESCAPE HATCH 3: Fresh API data says not charging = done
                     else:
-                        log("Night stop: BLE not allowed; will retry next loop")
+                        state_age = now_ts - state.last_status_check if state.last_status_check else 9999
+                        charging_state_fresh = state_age < STATUS_CHECK_INTERVAL * 1.5
 
+                        if charging_state_fresh and state.cached_charging_state != 'Charging':
+                            log("Night stop: car already not charging (fresh data)")
+                            state.night_stop_sent = True
+                        elif ble_allowed():
+                            if stop_charging():
+                                log("Night stop: BLE stop succeeded")
+                                state.night_stop_sent = True
+                            else:
+                                log("Night stop: BLE stop failed; will retry next loop")
+                        else:
+                            log("Night stop: BLE not allowed; will retry next loop")
                 else:
-                    log("Night mode: idle (charging already stopped)")
-
-                twc_amps = get_twc_current_amps()
-                if twc_amps is not None and twc_amps > 0.5:
-                    log(f"⚠️ Night mode: TWC shows {twc_amps:.1f}A still flowing - retrying stop")
-                    state.night_stop_sent = False
+                    # Only check for drift if we thought we were charging
+                    if state.current_amps > 0:
+                        twc_amps = get_twc_current_amps()
+                        if twc_amps is not None and twc_amps > 0.5:
+                            log(f"⚠️ Night mode: TWC shows {twc_amps:.1f}A still flowing - retrying stop")
+                            state.night_stop_sent = False
+                        else:
+                            log("Night mode: idle (charging stopped)")
+                    else:
+                        log("Night mode: idle (not charging)")
 
                 update_dashboard_status(mode, 0, 0, state.cached_battery, excess_smooth, prod_smooth, 'Stopped')
                 time.sleep(LOOP_INTERVAL)
@@ -867,8 +1043,8 @@ def main():
         else:
             if state.last_low_prod_time is not None:
                 log("Production recovered, resetting night timer")
-                state.last_low_prod_time = None
-                state.night_stop_sent = False
+            state.last_low_prod_time = None
+            state.night_stop_sent = False
 
         # ========================================
         # 5) PERIODIC TESLA STATUS
@@ -883,16 +1059,28 @@ def main():
         # 7) SOLAR MODE
         # ========================================
         mode = 'SOLAR'
-
+        
         # [NEW] High Solar Wake-Up
         # If we have strong sustained solar excess but the car is not charging,
-        # it may be in deep sleep. Wake once (cooldown protected) to allow BLE charging.
-        if excess_smooth > 1000 and charging_state != 'Charging' and twc_state is True:
-            if wake_vehicle_safe():
+        # and BLE is currently blocked, the car may be in deep sleep.
+        # Wake once (cooldown protected) to allow BLE charging.
+        # [NEW] High Solar Wake-Up
+        # SOLAR WAKE — must run before any BLE
+        if (
+            excess_smooth > 500 and
+            charging_state != 'Charging' and
+            twc_state is True and
+            state.ble_fail_count >= 2
+        ):
+            if wake_vehicle_safe('solar'):
                 log(
                     f"WAKE_SOLAR excess_smooth={int(excess_smooth)}W "
-                    f"battery={battery}% charging_state={charging_state}"
+                    f"battery={battery}% charging_state={charging_state} "
+                    f"ble_fails={state.ble_fail_count}"
                 )
+                log("SOLAR: Wake sent, skipping BLE this loop")
+                time.sleep(LOOP_INTERVAL)
+                continue
 
         raw_target = calculate_target_amps(excess_smooth)
         banded_target = (raw_target // AMP_STABILITY_BAND) * AMP_STABILITY_BAND
@@ -904,6 +1092,12 @@ def main():
         if len(state.amp_target_history) >= AMP_STABILITY_COUNT and all(a == banded_target for a in state.amp_target_history):
             if abs(banded_target - state.current_amps) >= AMP_CHANGE_THRESHOLD:
                 if excess_smooth <= 0 and state.current_amps == 0:
+                    twc_amps = get_twc_current_amps()
+                    if twc_amps is not None and twc_amps > 1.0:
+                        log(f"⚠️ WARNING: TWC shows {twc_amps:.1f}A but script not controlling - external charge?")
+                        state.grid_charge_warning_amps = twc_amps
+                    else:
+                        state.grid_charge_warning_amps = None
                     log(f"Stable target {banded_target}A but no solar excess - skipping BLE")
                 else:
                     log(f"Stable target {banded_target}A differs by {abs(banded_target - state.current_amps)}A - adjusting")
@@ -913,8 +1107,6 @@ def main():
                         start_charging()
                     elif state.last_charge_limit_set != BATTERY_TARGET and ble_allowed():
                         set_charge_limit(BATTERY_TARGET)
-                    else:
-                        log(f"Stable at {state.current_amps}A, target {banded_target}A within threshold")
             else:
                 log(f"Stable at {state.current_amps}A, target {banded_target}A within threshold")
         else:

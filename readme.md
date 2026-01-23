@@ -1,16 +1,18 @@
-# Tesla Solar Charger (BLE + TWC Edition) - v4.0.1
+# Tesla Solar Charger (BLE + TWC Edition) - v4.0.6
 
 Automated Tesla charging control script running on Raspberry Pi. This system adjusts charging amperage in real-time based on solar excess, using local Bluetooth (BLE) control to avoid Tesla API rate limits and wake issues.
 
-## ⚡ Core Features (v4.0.1)
+## ⚡ Core Features (v4.0.6)
 
 * **Solar Tracking:** Monitors Enphase Envoy data to adjust vehicle charging amps (1A increments) to match solar export.
 * **BLE-First Control:** Uses `tesla-control` (Bluetooth Low Energy) for all commands (Start/Stop/Set Amps). This is faster than the HTTP API and prevents "waking" the car unnecessarily.
 * **TWC Integration:** Polls the Tesla Wall Connector (Gen 2/3) API locally to detect "Plugged In" state instantly.
-* **Smart Disconnect (v4.0.1):** Automatically resets the car to **MAX_AMPS (48A)** when unplugged.
+* **Smart Disconnect:** Automatically resets the car to **MAX_AMPS (48A)** when unplugged.
     * *Edge Case Handling:* If BLE is on cooldown when you unplug, the system flags a "pending normalization" and forces the reset immediately upon the next connection.
 * **Zero-Grid Drain:** "Night Mode" automatically stops charging when solar production drops below 100W for 10 minutes.
 * **Emergency Mode:** If battery drops below 50%, the system overrides solar rules and charges at full speed (48A) until the target is reached.
+* **BLE Relay Support (v4.0.5):** Optional Pi Zero proxy for improved BLE range.
+* **Fast MANUAL Wake (v4.0.6):** When MANUAL mode is enabled and the vehicle is asleep, immediately wakes and retries BLE (~30s vs ~3min old behavior).
 
 ## 🛠️ Technical Architecture
 
