@@ -33,5 +33,87 @@ Automated Tesla charging control script running on Raspberry Pi. This system adj
 2.  **Auth:** Place your `private.pem` and `cache.json` in the application directory.
 3.  **Deploy:** Run via Systemd or Docker.
 
+## 🔌 Dashboard API Contract
+
+The charger expects a dashboard/controller to provide these HTTP endpoints. You can implement these using Home Assistant, Node-RED, Flask, or any web framework.
+
+### Required Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/envoy_data` | GET | Returns solar production data |
+| `/api/charging/config` | GET | Returns current charging mode |
+| `/api/set_charger_status` | POST | Receives status updates from charger |
+| `/api/twc/vehicle_connected` | GET | Returns TWC plug state |
+
+### Endpoint Details
+
+**GET `/api/envoy_data`** - Solar production data
+```json
+{
+  "production_watts": 5200,
+  "excess_watts": 3100
+}
+```
+
+**GET `/api/charging/config`** - Current mode setting
+```json
+{
+  "mode": "SOLAR"
+}
+```
+Valid modes: `SOLAR` (charge from excess only), `MANUAL` (charge at max amps)
+
+**POST `/api/set_charger_status`** - Status update from charger
+The charger POSTs its current state every loop. Your dashboard can display this:
+```json
+{
+  "mode": "SOLAR",
+  "amps": 24,
+  "target_amps": 26,
+  "battery": 65,
+  "battery_age_sec": 120,
+  "excess_watts": 6200,
+  "production_watts": 7100,
+  "state": "Charging",
+  "timestamp": "2025-01-24T14:30:00",
+  "ble_fail_count": 0,
+  "ble_backoff_remaining": 0,
+  "grid_charge_warning_amps": null
+}
+```
+
+**GET `/api/twc/vehicle_connected`** - TWC connection state
+```json
+{
+  "connected": true,
+  "data_age_seconds": 5
+}
+```
+
+### Optional: Mode Control
+
+To switch between SOLAR and MANUAL mode from a UI, implement:
+
+**POST `/api/charging/mode`** - Set charging mode
+```json
+{"mode": "MANUAL"}
+```
+Response:
+```json
+{"status": "success", "new_mode": "MANUAL"}
+```
+
+This writes to a config file that `/api/charging/config` reads from.
+
+### Optional: BLE Relay
+
+If using a Pi Zero as a BLE relay (for improved range), the charger calls:
+
+**POST `http://<relay-host>:5003/ble/command`**
+```json
+{"command": "charging-set-amps", "args": ["24"]}
+```
+
 ## ⚠️ Disclaimer
 Use at your own risk. This script interfaces directly with vehicle charging hardware and high-voltage systems.
