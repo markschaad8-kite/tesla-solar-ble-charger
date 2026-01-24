@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
+Solar Charger - v4.0.7 - Fixed solar excess utilization algorithm + cold start sync
 Solar Charger - v4.0.6 - MANUAL mode immediate wake on first BLE fail if vehicle asleep
 Solar Charger - v4.0.5 - BLE Relay support (Pi Zero proxy for improved range)
 Solar Charger - v4.0.4 - Separate MANUAL/SOLAR wake cooldowns + SOLAR wake requires BLE failures
@@ -63,7 +64,7 @@ Solar Charger - BLE Edition v3.6.6 / v3.6.5 / v3.6.4
 ================================================================================
 """
 
-VERSION = "v4.0.6"
+VERSION = "v4.0.7"
 
 import time
 import math
@@ -126,6 +127,7 @@ CACHE_TTL = 600
 AMP_CHANGE_THRESHOLD = 2
 AMP_STABILITY_COUNT = 1
 AMP_STABILITY_BAND = 2
+MAX_AMP_STEP = 4  # Max amp increase per loop (Envoy updates every 60s, loop is 30s)
 SMOOTH_WINDOW = 3
 SUSTAINED_NIGHT_SEC = 600
 
@@ -655,11 +657,20 @@ def stop_charging():
 # -------------------------------
 # Charging logic
 # -------------------------------
-def calculate_target_amps(excess_watts):
-    target = MIN_AMPS
-    if excess_watts > 0:
-        target += int(excess_watts / VOLTAGE)
-    return min(target, MAX_AMPS)
+def calculate_target_amps(excess_watts, current_amps):
+    """Calculate target amps by adding excess-based delta to current charging.
+
+    Rate-limits increases to MAX_AMP_STEP per loop to allow measurements to catch up.
+    Decreases are not rate-limited to quickly reduce grid imports.
+    """
+    delta = int(excess_watts / VOLTAGE)
+
+    # Rate-limit increases only (decreases can be immediate to avoid grid import)
+    if delta > MAX_AMP_STEP:
+        delta = MAX_AMP_STEP
+
+    target = current_amps + delta
+    return max(MIN_AMPS, min(target, MAX_AMPS))
 
 
 # -------------------------------
@@ -689,6 +700,13 @@ def main():
     battery, is_home, charging_state = get_tesla_status()
     if is_home is None:
         is_home = False
+
+    # Sync current_amps from TWC if car is already charging (cold start recovery)
+    if charging_state == 'Charging':
+        twc_amps = get_twc_current_amps()
+        if twc_amps is not None and twc_amps >= MIN_AMPS:
+            state.current_amps = int(twc_amps)
+            log(f"Cold start: synced current_amps from TWC = {state.current_amps}A")
 
     loop_count = 0
 
@@ -1082,7 +1100,7 @@ def main():
                 time.sleep(LOOP_INTERVAL)
                 continue
 
-        raw_target = calculate_target_amps(excess_smooth)
+        raw_target = calculate_target_amps(excess_smooth, state.current_amps)
         banded_target = (raw_target // AMP_STABILITY_BAND) * AMP_STABILITY_BAND
         banded_target = max(MIN_AMPS, banded_target)
         log(f"Target: {raw_target}A raw -> {banded_target}A banded (current: {state.current_amps}A)")
