@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 ================================================================================
+Solar Charger - v4.0.9 - Skip BLE commands when charging_state is 'Complete' + lint fixes
+Solar Charger - v4.0.8 - Solar Takeover feature for grid-charging detection
 Solar Charger - v4.0.7 - Fixed solar excess utilization algorithm + cold start sync
 Solar Charger - v4.0.6 - MANUAL mode immediate wake on first BLE fail if vehicle asleep
 Solar Charger - v4.0.5 - BLE Relay support (Pi Zero proxy for improved range)
@@ -64,7 +66,7 @@ Solar Charger - BLE Edition v3.6.6 / v3.6.5 / v3.6.4
 ================================================================================
 """
 
-VERSION = "v4.0.8"
+VERSION = "v4.0.9"
 
 import time
 import math
@@ -109,8 +111,8 @@ BLE_RELAY_URL = f"http://{BLE_RELAY_HOST}:{BLE_RELAY_PORT}"
 TWC_CACHE_TTL = 15
 TWC_STALE_THRESHOLD = 90
 
-HOME_LAT = 0.0000                   # <--- UPDATE THIS (your latitude)
-HOME_LON = 0.0000                   # <--- UPDATE THIS (your longitude)
+HOME_LAT = 0.0000    # <--- UPDATE THIS with your home latitude
+HOME_LON = 0.0000    # <--- UPDATE THIS with your home longitude
 HOME_RADIUS_MILES = 0.25
 
 VOLTAGE = 240
@@ -537,7 +539,10 @@ def run_tesla_control_via_relay(cmd):
         duration = data.get('duration', 0)
 
         # Log relay usage
-        log(f"BLE relay: {command} {' '.join(str(a) for a in args)} -> {'OK' if success else 'FAILED'} ({duration:.1f}s)")
+        log(
+            f"BLE relay: {command} {' '.join(str(a) for a in args)} "
+            f"-> {'OK' if success else 'FAILED'} ({duration:.1f}s)"
+        )
 
         return success, output.lower()
 
@@ -890,8 +895,11 @@ def main():
 
             log(f"MODE: MANUAL - Charging at MAX to {BATTERY_TARGET}%")
 
-            ble_succeeded = False
-            if state.current_amps != MAX_AMPS:
+            # Skip BLE commands if charging is complete (car reached target)
+            if charging_state == 'Complete':
+                log("MANUAL: Charging complete - skipping BLE commands")
+                ble_succeeded = True
+            elif state.current_amps != MAX_AMPS:
                 ble_succeeded = set_charging_amps(MAX_AMPS)
             elif charging_state != 'Charging' and ble_allowed():
                 ble_succeeded = start_charging()
@@ -925,9 +933,15 @@ def main():
 
             solar = get_solar_data()
             if solar:
-                update_dashboard_status(mode, state.current_amps, MAX_AMPS, battery, solar['excess'], solar['production'], charging_state or 'Charging')
+                update_dashboard_status(
+                    mode, state.current_amps, MAX_AMPS, battery,
+                    solar['excess'], solar['production'], charging_state or 'Charging'
+                )
             else:
-                update_dashboard_status(mode, state.current_amps, MAX_AMPS, battery, 0, 0, charging_state or 'Charging')
+                update_dashboard_status(
+                    mode, state.current_amps, MAX_AMPS, battery,
+                    0, 0, charging_state or 'Charging'
+                )
 
             log(f"Loop duration: {time.time() - loop_start_ts:.1f}s")
             time.sleep(LOOP_INTERVAL)
@@ -954,7 +968,10 @@ def main():
             elapsed = time.time() - state.emergency_start_ts
             remaining = max(0, MAX_EMERGENCY_RUNTIME - elapsed)
 
-            log(f"MODE: EMERGENCY - Battery {battery}% < {BATTERY_EMERGENCY}% (elapsed {int(elapsed)}s, remaining {int(remaining)}s)")
+            log(
+                f"MODE: EMERGENCY - Battery {battery}% < {BATTERY_EMERGENCY}% "
+                f"(elapsed {int(elapsed)}s, remaining {int(remaining)}s)"
+            )
 
             if (time.time() - state.cached_ts) >= EMERGENCY_STATUS_INTERVAL:
                 log("EMERGENCY: forcing fresh Tesla status check")
@@ -994,8 +1011,13 @@ def main():
                         if twc_amps >= 1 and state.cached_charging_state != 'Charging':
                             charging_state = 'Charging'
 
-                        if state.current_amps == MAX_AMPS and state.cached_charging_state == 'Charging' and twc_amps < (MAX_AMPS - 5):
-                            log(f"⚠️ EMERGENCY: TWC shows {twc_amps:.1f}A but expected ~{MAX_AMPS}A. Will re-assert 48A/start on next allowed loop.")
+                        if (state.current_amps == MAX_AMPS
+                                and state.cached_charging_state == 'Charging'
+                                and twc_amps < (MAX_AMPS - 5)):
+                            log(
+                                f"⚠️ EMERGENCY: TWC shows {twc_amps:.1f}A but expected ~{MAX_AMPS}A. "
+                                f"Will re-assert 48A/start on next allowed loop."
+                            )
 
                     if twc_amps is not None and twc_amps < (MAX_AMPS - 5):
                         if ble_allowed() and not state.ble_command_this_loop:
@@ -1005,9 +1027,15 @@ def main():
 
                     solar = get_solar_data()
                     if solar:
-                        update_dashboard_status(mode, state.current_amps, MAX_AMPS, battery, solar['excess'], solar['production'], 'Charging')
+                        update_dashboard_status(
+                            mode, state.current_amps, MAX_AMPS, battery,
+                            solar['excess'], solar['production'], 'Charging'
+                        )
                     else:
-                        update_dashboard_status(mode, state.current_amps, MAX_AMPS, battery, 0, 0, 'Charging')
+                        update_dashboard_status(
+                            mode, state.current_amps, MAX_AMPS, battery,
+                            0, 0, 'Charging'
+                        )
 
                     log(f"Loop duration: {time.time() - loop_start_ts:.1f}s")
                     time.sleep(LOOP_INTERVAL)
@@ -1030,7 +1058,10 @@ def main():
         state.excess_window.append(excess)
         prod_smooth = sum(state.production_window) / len(state.production_window)
         excess_smooth = sum(state.excess_window) / len(state.excess_window)
-        log(f"Solar: {production:.0f}W prod, {excess:.0f}W excess (smoothed: {prod_smooth:.0f}W / {excess_smooth:.0f}W)")
+        log(
+            f"Solar: {production:.0f}W prod, {excess:.0f}W excess "
+            f"(smoothed: {prod_smooth:.0f}W / {excess_smooth:.0f}W)"
+        )
 
         # ========================================
         # 4) NIGHT DETECTION (with freshness check)
@@ -1140,18 +1171,28 @@ def main():
 
         state.amp_target_history.append(banded_target)
 
-        if len(state.amp_target_history) >= AMP_STABILITY_COUNT and all(a == banded_target for a in state.amp_target_history):
+        if (len(state.amp_target_history) >= AMP_STABILITY_COUNT
+                and all(a == banded_target for a in state.amp_target_history)):
             if abs(banded_target - state.current_amps) >= AMP_CHANGE_THRESHOLD:
                 if excess_smooth <= 0 and state.current_amps == 0:
                     twc_amps = get_twc_current_amps()
-                    if twc_amps is not None and twc_amps > 1.0:
+                    # Only warn if TWC shows significantly more than MIN_AMPS
+                    # If TWC shows ~6A, that's expected for solar mode with no excess
+                    if twc_amps is not None and twc_amps > (MIN_AMPS + 3):
                         log(f"⚠️ WARNING: TWC shows {twc_amps:.1f}A but script not controlling - external charge?")
                         state.grid_charge_warning_amps = twc_amps
                     else:
                         state.grid_charge_warning_amps = None
+                        if twc_amps is not None and twc_amps > 1.0:
+                            # TWC at low amps (~6A) - sync state to match
+                            log(f"TWC shows {twc_amps:.1f}A (near MIN_AMPS) - syncing state")
+                            state.current_amps = MIN_AMPS
                     log(f"Stable target {banded_target}A but no solar excess - skipping BLE")
                 else:
-                    log(f"Stable target {banded_target}A differs by {abs(banded_target - state.current_amps)}A - adjusting")
+                    log(
+                        f"Stable target {banded_target}A differs by "
+                        f"{abs(banded_target - state.current_amps)}A - adjusting"
+                    )
                     if state.current_amps != banded_target:
                         set_charging_amps(banded_target)
                     elif charging_state != 'Charging' and ble_allowed():
@@ -1161,9 +1202,12 @@ def main():
             else:
                 log(f"Stable at {state.current_amps}A, target {banded_target}A within threshold")
         else:
-            log(f"Building stability: {len(state.amp_target_history)}/{AMP_STABILITY_COUNT} -> {list(state.amp_target_history)}")
+            log(
+                f"Building stability: {len(state.amp_target_history)}/"
+                f"{AMP_STABILITY_COUNT} -> {list(state.amp_target_history)}"
+            )
 
-        if state.current_amps > 0 and charging_state != 'Charging' and ble_allowed():
+        if state.current_amps > 0 and charging_state not in ('Charging', 'Complete') and ble_allowed():
             log("Car not charging but amps > 0 -> starting charging")
             start_charging()
 
@@ -1175,7 +1219,10 @@ def main():
         # ========================================
         # 8) UPDATE DASHBOARD
         # ========================================
-        update_dashboard_status(mode, state.current_amps, banded_target, battery, excess_smooth, prod_smooth, charging_state or 'Unknown')
+        update_dashboard_status(
+            mode, state.current_amps, banded_target, battery,
+            excess_smooth, prod_smooth, charging_state or 'Unknown'
+        )
 
         log(f"Sleeping {LOOP_INTERVAL}s (mode={mode}, amps={state.current_amps})")
         log(f"Loop duration: {time.time() - loop_start_ts:.1f}s")
