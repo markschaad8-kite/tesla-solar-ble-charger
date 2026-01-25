@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
+Solar Charger - v4.0.10 - Remove charge limit enforcement in MANUAL mode (user controls via Tesla app)
 Solar Charger - v4.0.9 - Skip BLE commands when charging_state is 'Complete' + lint fixes
 Solar Charger - v4.0.8 - Solar Takeover feature for grid-charging detection
 Solar Charger - v4.0.7 - Fixed solar excess utilization algorithm + cold start sync
@@ -66,7 +67,7 @@ Solar Charger - BLE Edition v3.6.6 / v3.6.5 / v3.6.4
 ================================================================================
 """
 
-VERSION = "v4.0.9"
+VERSION = "v4.0.10"
 
 import time
 import math
@@ -903,8 +904,6 @@ def main():
                 ble_succeeded = set_charging_amps(MAX_AMPS)
             elif charging_state != 'Charging' and ble_allowed():
                 ble_succeeded = start_charging()
-            elif state.last_charge_limit_set != BATTERY_TARGET and ble_allowed():
-                ble_succeeded = set_charge_limit(BATTERY_TARGET)
             else:
                 ble_succeeded = True
 
