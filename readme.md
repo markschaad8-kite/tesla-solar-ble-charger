@@ -1,8 +1,8 @@
-# Tesla Solar Charger (BLE + TWC Edition) - v4.0.6
+# Tesla Solar Charger (BLE + TWC Edition) - v4.0.8
 
 Automated Tesla charging control script running on Raspberry Pi. This system adjusts charging amperage in real-time based on solar excess, using local Bluetooth (BLE) control to avoid Tesla API rate limits and wake issues.
 
-## ⚡ Core Features (v4.0.6)
+## ⚡ Core Features (v4.0.8)
 
 * **Solar Tracking:** Monitors Enphase Envoy data to adjust vehicle charging amps (1A increments) to match solar export.
 * **BLE-First Control:** Uses `tesla-control` (Bluetooth Low Energy) for all commands (Start/Stop/Set Amps). This is faster than the HTTP API and prevents "waking" the car unnecessarily.
@@ -13,6 +13,7 @@ Automated Tesla charging control script running on Raspberry Pi. This system adj
 * **Emergency Mode:** If battery drops below 50%, the system overrides solar rules and charges at full speed (48A) until the target is reached.
 * **BLE Relay Support (v4.0.5):** Optional Pi Zero proxy for improved BLE range.
 * **Fast MANUAL Wake (v4.0.6):** When MANUAL mode is enabled and the vehicle is asleep, immediately wakes and retries BLE (~30s vs ~3min old behavior).
+* **Solar Takeover (v4.0.8):** Dashboard button to force solar control when external charging is detected. Useful when plugging in during low-solar periods - the car defaults to max amps, but you can click "Solar Takeover" to let the script take control.
 
 ## 🛠️ Technical Architecture
 
@@ -42,7 +43,7 @@ The charger expects a dashboard/controller to provide these HTTP endpoints. You 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/api/envoy_data` | GET | Returns solar production data |
-| `/api/charging/config` | GET | Returns current charging mode |
+| `/api/charging/config` | GET | Returns current charging mode and flags |
 | `/api/set_charger_status` | POST | Receives status updates from charger |
 | `/api/twc/vehicle_connected` | GET | Returns TWC plug state |
 
@@ -56,10 +57,11 @@ The charger expects a dashboard/controller to provide these HTTP endpoints. You 
 }
 ```
 
-**GET `/api/charging/config`** - Current mode setting
+**GET `/api/charging/config`** - Current mode and control flags
 ```json
 {
-  "mode": "SOLAR"
+  "mode": "SOLAR",
+  "solar_takeover_requested": false
 }
 ```
 Valid modes: `SOLAR` (charge from excess only), `MANUAL` (charge at max amps)
@@ -105,6 +107,30 @@ Response:
 ```
 
 This writes to a config file that `/api/charging/config` reads from.
+
+### Optional: Solar Takeover (v4.0.8)
+
+When the car is plugged in and charging externally (e.g., at 48A from grid), the script detects this but doesn't interfere by default. To let users explicitly request solar control, implement:
+
+**POST `/api/charging/solar_takeover`** - Request solar control
+No body required. Sets `solar_takeover_requested: true` in the config.
+```json
+{"status": "success", "message": "Solar takeover requested"}
+```
+
+**POST `/api/charging/clear_takeover`** - Clear takeover flag (called by charger)
+The charger calls this after successfully sending the BLE command.
+```json
+{"status": "success", "message": "Takeover flag cleared"}
+```
+
+**How it works:**
+1. User plugs in car → car charges at last-used rate (e.g., 48A)
+2. Script sees TWC at 48A but `current_amps=0` (not controlling) → logs warning
+3. Dashboard shows "External Charging Detected" with "Solar Takeover" button
+4. User clicks button → dashboard sets `solar_takeover_requested: true`
+5. Script reads flag → sends BLE `set-amps 6` → clears flag
+6. Script now controls charging based on solar excess
 
 ### Optional: BLE Relay
 

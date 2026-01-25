@@ -64,7 +64,7 @@ Solar Charger - BLE Edition v3.6.6 / v3.6.5 / v3.6.4
 ================================================================================
 """
 
-VERSION = "v4.0.7"
+VERSION = "v4.0.8"
 
 import time
 import math
@@ -78,7 +78,7 @@ from typing import Optional, Deque, Dict, Any
 
 
 # -------------------------------
-# CONFIG - UPDATE THESE FOR YOUR SETUP
+# CONFIG (unchanged)
 # -------------------------------
 VIN = "YOUR_VIN_HERE"               # <--- UPDATE THIS
 KEY_FILE = "/app/private.pem"
@@ -302,11 +302,28 @@ def get_solar_data():
 
 
 def get_charging_config():
+    """Returns full config dict including mode and solar_takeover_requested flag"""
     try:
         r = requests.get(PI2_CONFIG_URL, timeout=4)
-        return r.json().get('mode', 'SOLAR')
+        return r.json()
     except:
-        return 'SOLAR'
+        return {'mode': 'SOLAR'}
+
+
+def clear_solar_takeover():
+    """Clear the solar takeover flag after acting on it"""
+    try:
+        url = f"{SOLAR_API_BASE}:8080/api/charging/clear_takeover"
+        r = requests.post(url, timeout=4)
+        if r.status_code == 200:
+            log("Solar takeover flag cleared")
+            return True
+        else:
+            log(f"Failed to clear takeover flag: HTTP {r.status_code}")
+            return False
+    except Exception as e:
+        log(f"ERROR clearing takeover flag: {e}")
+        return False
 
 
 def update_dashboard_status(mode, amps, target_amps, battery, excess_watts, production_watts, chg_state):
@@ -833,7 +850,23 @@ def main():
         # ========================================
         # 2) MANUAL MODE CHECK (before night!)
         # ========================================
-        dashboard_mode = get_charging_config()
+        dashboard_config = get_charging_config()
+        dashboard_mode = dashboard_config.get('mode', 'SOLAR')
+
+        # ========================================
+        # 2a) SOLAR TAKEOVER CHECK
+        # ========================================
+        # If user requested solar takeover via dashboard button, immediately take control
+        if dashboard_config.get('solar_takeover_requested', False):
+            log("☀️ SOLAR TAKEOVER: User requested solar control via dashboard")
+            # Send BLE command to set minimum amps - this kicks us into control mode
+            if set_charging_amps(MIN_AMPS):
+                log(f"☀️ SOLAR TAKEOVER: Set to {MIN_AMPS}A - script now controlling")
+                clear_solar_takeover()  # Clear the flag
+                state.grid_charge_warning_amps = None  # Clear the warning
+            else:
+                log("☀️ SOLAR TAKEOVER: BLE command failed - will retry next loop")
+            # Continue with normal loop - script will now track solar
 
         if dashboard_mode == 'MANUAL':
             if not state.last_manual_state:
