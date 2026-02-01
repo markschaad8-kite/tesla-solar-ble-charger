@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
+Solar Charger - v4.0.11 - Preconditioning detection (skip amp adjustments during precond via API or dashboard)
 Solar Charger - v4.0.10 - Remove charge limit enforcement in MANUAL mode (user controls via Tesla app)
 Solar Charger - v4.0.9 - Skip BLE commands when charging_state is 'Complete' + lint fixes
 Solar Charger - v4.0.8 - Solar Takeover feature for grid-charging detection
@@ -67,7 +68,7 @@ Solar Charger - BLE Edition v3.6.6 / v3.6.5 / v3.6.4
 ================================================================================
 """
 
-VERSION = "v4.0.10"
+VERSION = "v4.0.11"
 
 import time
 import math
@@ -160,6 +161,7 @@ class ChargerState:
     cached_battery: Optional[int] = None
     cached_is_home: Optional[bool] = None
     cached_charging_state: Optional[str] = None
+    cached_is_preconditioning: bool = False
     cached_vehicle_online: bool = True
     cached_ts: float = 0.0
     last_status_check: float = 0.0
@@ -329,6 +331,12 @@ def clear_solar_takeover():
         return False
 
 
+def is_precondition_inhibit_active(config: dict) -> bool:
+    """Check if dashboard precondition inhibit flag is still active (30 min window)"""
+    inhibit_ts = config.get('precondition_inhibit_until', 0)
+    return time.time() < inhibit_ts
+
+
 def update_dashboard_status(mode, amps, target_amps, battery, excess_watts, production_watts, chg_state):
     try:
         battery_age_sec = int(time.time() - state.cached_ts) if state.cached_ts > 0 else None
@@ -345,7 +353,8 @@ def update_dashboard_status(mode, amps, target_amps, battery, excess_watts, prod
             'ble_fail_count': state.ble_fail_count,
             'ble_backoff_until': state.ble_backoff_until,
             'ble_backoff_remaining': max(0, int(state.ble_backoff_until - time.time())),
-            'grid_charge_warning_amps': state.grid_charge_warning_amps
+            'grid_charge_warning_amps': state.grid_charge_warning_amps,
+            'is_preconditioning': state.cached_is_preconditioning
         }
         requests.post(PI2_STATUS_URL, json=payload, timeout=3)
     except Exception as e:
@@ -382,15 +391,20 @@ def get_tesla_status():
             battery = charge_state.get('battery_level', state.cached_battery)
             charging = charge_state.get('charging_state', state.cached_charging_state)
 
+            # Fetch preconditioning status from climate_state
+            climate_state = data.get('climate_state', {})
+            is_preconditioning = climate_state.get('is_preconditioning', False)
+
             # Only update cache on successful fetch
             state.cached_battery = battery
             state.cached_is_home = is_home
             state.cached_charging_state = charging
+            state.cached_is_preconditioning = is_preconditioning
             state.cached_vehicle_online = True
             state.cached_ts = now
             state.last_status_check = now
 
-            log(f"Tesla: Battery={battery}%, Home={is_home}, State={charging}")
+            log(f"Tesla: Battery={battery}%, Home={is_home}, State={charging}, Precond={is_preconditioning}")
             return battery, is_home, charging
     except Exception as e:
         log(f"Tesla status error: {e}")
@@ -1188,16 +1202,24 @@ def main():
                             state.current_amps = MIN_AMPS
                     log(f"Stable target {banded_target}A but no solar excess - skipping BLE")
                 else:
-                    log(
-                        f"Stable target {banded_target}A differs by "
-                        f"{abs(banded_target - state.current_amps)}A - adjusting"
-                    )
-                    if state.current_amps != banded_target:
-                        set_charging_amps(banded_target)
-                    elif charging_state != 'Charging' and ble_allowed():
-                        start_charging()
-                    elif state.last_charge_limit_set != BATTERY_TARGET and ble_allowed():
-                        set_charge_limit(BATTERY_TARGET)
+                    # Check preconditioning inhibit (auto-detect OR dashboard flag)
+                    precond_active = state.cached_is_preconditioning
+                    inhibit_active = is_precondition_inhibit_active(dashboard_config)
+
+                    if precond_active or inhibit_active:
+                        reason = "API detected" if precond_active else "dashboard inhibit"
+                        log(f"⏸️  Preconditioning active ({reason}) - skipping amp adjustment (target was {banded_target}A)")
+                    else:
+                        log(
+                            f"Stable target {banded_target}A differs by "
+                            f"{abs(banded_target - state.current_amps)}A - adjusting"
+                        )
+                        if state.current_amps != banded_target:
+                            set_charging_amps(banded_target)
+                        elif charging_state != 'Charging' and ble_allowed():
+                            start_charging()
+                        elif state.last_charge_limit_set != BATTERY_TARGET and ble_allowed():
+                            set_charge_limit(BATTERY_TARGET)
             else:
                 log(f"Stable at {state.current_amps}A, target {banded_target}A within threshold")
         else:
