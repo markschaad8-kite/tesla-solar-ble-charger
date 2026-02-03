@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-Solar Charger TWC Fork - v4.0.12-twc - Relay payload fix + reset helpers refactor
+Solar Charger TWC Fork - v4.0.13-twc - Wake cache consistency + auth cache structure fix
 Solar Charger TWC Fork - v4.0.11-twc - Preconditioning detection (skip amp adjustments during precond)
 Solar Charger TWC Fork - v4.0.10-twc - TWC-only home detection (no GPS fallback)
 ================================================================================
@@ -19,6 +19,13 @@ Based on: Solar Charger v4.0.10
 ================================================================================
 HISTORICAL CHANGELOG (PRESERVED VERBATIM)
 ================================================================================
+
+v4.0.13-twc - Wake cache consistency + auth cache structure fix
+- BUG FIX: wake_vehicle_safe() now uses the same cache file path as get_tesla_status()
+  to prevent silent auth failures during API wake attempts. Both functions now
+  consistently use CACHE_FILE (/app/cache.json) for teslapy authentication.
+- BUG FIX: auth_cache_status() now correctly checks the teslapy cache structure
+  (nested under email -> sso -> tokens) instead of looking for tokens at root level.
 
 v4.0.12-twc - Relay payload fix + reset helpers refactor
 - BUG FIX: BLE relay was sending "-domain" as the command instead of the actual
@@ -66,7 +73,7 @@ Solar Charger - BLE Edition v3.6.6 / v3.6.5 / v3.6.4
 ================================================================================
 """
 
-VERSION = "v4.0.12-twc"
+VERSION = "v4.0.13-twc"
 
 import time
 import subprocess
@@ -215,8 +222,12 @@ def auth_cache_status(cache_path: str) -> str:
         import json
         with open(cache_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if 'access_token' in data and 'refresh_token' in data:
-            return "OK (tokens present)"
+        # teslapy cache structure: {email: {url: ..., sso: {access_token, refresh_token, ...}}}
+        for email, email_data in data.items():
+            if isinstance(email_data, dict):
+                sso = email_data.get('sso', {})
+                if 'access_token' in sso and 'refresh_token' in sso:
+                    return "OK (tokens present)"
         return "MISSING TOKENS"
     except json.JSONDecodeError as e:
         return f"ERROR: cache file is not valid JSON ({e})"
@@ -389,7 +400,7 @@ def get_tesla_status():
         return state.cached_battery, state.cached_charging_state
     try:
         import teslapy
-        with teslapy.Tesla(TESLA_EMAIL, cache_file='/app/cache.json') as tesla:
+        with teslapy.Tesla(TESLA_EMAIL, cache_file=CACHE_FILE) as tesla:
             vehicles = tesla.vehicle_list()
             if not vehicles:
                 log("No vehicles found (teslapy)")
@@ -448,7 +459,7 @@ def wake_vehicle_safe(reason: str = 'manual'):
 
     try:
         import teslapy
-        with teslapy.Tesla(TESLA_EMAIL) as tesla:
+        with teslapy.Tesla(TESLA_EMAIL, cache_file=CACHE_FILE) as tesla:
             vehicles = tesla.vehicle_list()
             if not vehicles:
                 log(f"Wake failed [{reason}]: no vehicles found")
