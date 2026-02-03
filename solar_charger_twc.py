@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
+Solar Charger TWC Fork - v4.0.12-twc - Relay payload fix + reset helpers refactor
 Solar Charger TWC Fork - v4.0.11-twc - Preconditioning detection (skip amp adjustments during precond)
 Solar Charger TWC Fork - v4.0.10-twc - TWC-only home detection (no GPS fallback)
 ================================================================================
@@ -18,6 +19,16 @@ Based on: Solar Charger v4.0.10
 ================================================================================
 HISTORICAL CHANGELOG (PRESERVED VERBATIM)
 ================================================================================
+
+v4.0.12-twc - Relay payload fix + reset helpers refactor
+- BUG FIX: BLE relay was sending "-domain" as the command instead of the actual
+  command (e.g., "charging-set-amps"). Fixed by passing structured payload directly
+  to relay instead of parsing the arg list.
+- REFACTOR: Consolidated repeated state reset patterns into two helper functions:
+  - reset_away_mode_state(): For AWAY mode entries
+  - reset_session_state(): For session boundaries (clears BLE backoff too)
+- IMPROVEMENT: auth_cache_status() now uses proper JSON parsing instead of
+  substring matching for more robust token validation.
 
 V3.6.9 solar_charger - Emergency mode TWC verification and reassert
 - BUG FIX: Emergency mode could believe 48A was set while actual charging was limited
@@ -55,7 +66,7 @@ Solar Charger - BLE Edition v3.6.6 / v3.6.5 / v3.6.4
 ================================================================================
 """
 
-VERSION = "v4.0.11-twc"
+VERSION = "v4.0.12-twc"
 
 import time
 import subprocess
@@ -92,7 +103,7 @@ TWC_MONITOR_URL = f"{SOLAR_API_BASE}:5002/api/twc/vehicle_connected"
 # BLE RELAY CONFIG (Pi Zero proxy)
 # -------------------------------
 BLE_RELAY_ENABLED = os.getenv("BLE_RELAY_ENABLED", "true").lower() == "true"
-BLE_RELAY_HOST = os.getenv("BLE_RELAY_HOST", "SolarPiZero")
+BLE_RELAY_HOST = os.getenv("BLE_RELAY_HOST", "localhost")
 BLE_RELAY_PORT = int(os.getenv("BLE_RELAY_PORT", "5003"))
 BLE_RELAY_URL = f"http://{BLE_RELAY_HOST}:{BLE_RELAY_PORT}"
 
@@ -201,11 +212,14 @@ state = ChargerState()
 # -------------------------------
 def auth_cache_status(cache_path: str) -> str:
     try:
+        import json
         with open(cache_path, "r", encoding="utf-8") as f:
-            data = f.read()
-        if '"access_token"' in data and '"refresh_token"' in data:
+            data = json.load(f)
+        if 'access_token' in data and 'refresh_token' in data:
             return "OK (tokens present)"
         return "MISSING TOKENS"
+    except json.JSONDecodeError as e:
+        return f"ERROR: cache file is not valid JSON ({e})"
     except Exception as e:
         return f"ERROR reading cache ({type(e).__name__}: {e})"
 
@@ -221,6 +235,25 @@ def log(msg: str) -> None:
 # Utilities
 # -------------------------------
 # get_distance_miles REMOVED in TWC fork - GPS geofencing not used
+
+
+def reset_away_mode_state():
+    """Reset state flags when entering AWAY mode or safe-default fallback.
+    Used on: TWC disconnected, TWC unreachable with no/disconnected cache."""
+    state.night_stop_sent = False
+    state.manual_ble_fails = 0
+    state.ble_fail_count = 0
+    state.emergency_start_ts = None
+
+
+def reset_session_state():
+    """Reset BLE + emergency state on session boundary (disconnect edge).
+    Clears backoff in addition to the flags reset_away_mode_state clears,
+    because a new physical session means the BLE backoff context is stale."""
+    state.manual_ble_fails = 0
+    state.ble_fail_count = 0
+    state.ble_backoff_until = 0.0
+    state.emergency_start_ts = None
 
 
 # -------------------------------
@@ -462,10 +495,12 @@ def ble_allowed():
     return True
 
 
-def run_tesla_control(cmd):
-    """Execute tesla-control command, either via BLE relay or locally."""
+def run_tesla_control(cmd, relay_command=None, relay_args=None, relay_domain='infotainment'):
+    """Execute tesla-control command, either via BLE relay or locally.
+    When relay is enabled, relay_command/relay_args/relay_domain are used directly
+    instead of parsing the cmd list."""
     if BLE_RELAY_ENABLED:
-        return run_tesla_control_via_relay(cmd)
+        return run_tesla_control_via_relay(relay_command, relay_args, relay_domain)
     else:
         return run_tesla_control_local(cmd)
 
@@ -480,51 +515,22 @@ def run_tesla_control_local(cmd):
         return False, str(e)
 
 
-def run_tesla_control_via_relay(cmd):
+def run_tesla_control_via_relay(command, args, domain='infotainment'):
     """
     Execute tesla-control via Pi Zero BLE relay.
-
-    The cmd list looks like:
-    ['tesla-control', '-ble', '-key-file', '/app/private.pem', '-vin', 'XXX', 'charging-set-amps', '20']
-
-    We extract the command and args, send to relay.
+    Receives the command, args, and domain directly — no parsing needed.
     """
     try:
-        # Parse the command list to extract the actual command and args
-        # Skip the tesla-control binary and standard flags
-        command = None
-        args = []
-        skip_next = False
-
-        for part in cmd:
-            if skip_next:
-                skip_next = False
-                continue
-
-            # Skip the binary name
-            if part == 'tesla-control' or part.endswith('tesla-control'):
-                continue
-
-            # Skip flags and their values
-            if part in ['-ble', '-debug']:
-                continue
-            if part in ['-key-file', '-vin', '-key-name']:
-                skip_next = True  # Skip the next value too
-                continue
-
-            # This must be the command or an arg
-            if command is None:
-                command = part
-            else:
-                args.append(part)
-
         if not command:
-            return False, "could not parse command from cmd list"
+            return False, "no command provided for relay"
 
-        # Send to relay
+        if args is None:
+            args = []
+
+        # Send to relay with domain for proper flag placement
         response = requests.post(
             f"{BLE_RELAY_URL}/ble/command",
-            json={'command': command, 'args': args},
+            json={'command': command, 'args': args, 'domain': domain},
             timeout=60  # Allow for BLE timeout + network
         )
 
@@ -585,12 +591,17 @@ def ble_call(cmd, val=None, domain='infotainment'):
     # Only set to True if we're actually going to attempt BLE
     state.ble_attempted_this_loop = True
 
-    args = ["tesla-control", "-domain", domain, "-ble", "-vin", VIN, "-key-file", KEY_FILE, cmd]
+    # Build local subprocess args (used only if relay is disabled)
+    local_args = ["tesla-control", "-domain", domain, "-ble", "-vin", VIN, "-key-file", KEY_FILE, cmd]
     if val is not None:
-        args.append(str(val))
+        local_args.append(str(val))
+
+    # Build relay payload directly — avoids parsing the arg list back apart
+    # Include domain so relay can place -domain flag correctly
+    relay_args = [str(val)] if val is not None else []
 
     log(f"BLE >>> {cmd} {val if val else ''} ({domain})")
-    ok, out = run_tesla_control(args)
+    ok, out = run_tesla_control(local_args, relay_command=cmd, relay_args=relay_args, relay_domain=domain)
 
     state.ble_command_this_loop = True
     state.last_ble_time = time.time()
@@ -763,10 +774,7 @@ def main():
                 log("  └─ Disconnect normalize gated; will retry once on next connect")
 
             # Session-scoped resets (3.6.8 parity)
-            state.manual_ble_fails = 0
-            state.ble_fail_count = 0
-            state.ble_backoff_until = 0.0
-            state.emergency_start_ts = None
+            reset_session_state()
 
         if state.last_twc_state is False and twc_state is True:
             state.session_start_ts = time.time()
@@ -793,10 +801,7 @@ def main():
 
         if twc_state is False:
             log("TWC: Not connected -> AWAY mode")
-            state.night_stop_sent = False
-            state.manual_ble_fails = 0
-            state.ble_fail_count = 0
-            state.emergency_start_ts = None
+            reset_away_mode_state()
 
             # Track night mode even while away
             solar = get_solar_data()
@@ -833,10 +838,7 @@ def main():
             twc_state = state.twc_cache.get('value')
             if twc_state is None:
                 log("TWC: No cached state available -> AWAY mode (safe default)")
-                state.night_stop_sent = False
-                state.manual_ble_fails = 0
-                state.ble_fail_count = 0
-                state.emergency_start_ts = None
+                reset_away_mode_state()
 
                 update_dashboard_status("AWAY", 0, 0, state.cached_battery, 0, 0, 'TWC Unreachable')
                 time.sleep(LOOP_INTERVAL)
@@ -844,10 +846,7 @@ def main():
             elif twc_state is False:
                 # Cached state was disconnected - treat as AWAY mode
                 log("TWC: Cached state was disconnected -> AWAY mode")
-                state.night_stop_sent = False
-                state.manual_ble_fails = 0
-                state.ble_fail_count = 0
-                state.emergency_start_ts = None
+                reset_away_mode_state()
 
                 update_dashboard_status("AWAY", 0, 0, state.cached_battery, 0, 0, 'Disconnected (cached)')
                 time.sleep(LOOP_INTERVAL)
