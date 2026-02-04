@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-Solar Charger TWC Fork - v4.0.13-twc - Wake cache consistency + auth cache structure fix
+Solar Charger TWC Fork - v4.0.14-twc - TWC stale data polling optimization
 Solar Charger TWC Fork - v4.0.11-twc - Preconditioning detection (skip amp adjustments during precond)
 Solar Charger TWC Fork - v4.0.10-twc - TWC-only home detection (no GPS fallback)
 ================================================================================
@@ -19,6 +19,11 @@ Based on: Solar Charger v4.0.10
 ================================================================================
 HISTORICAL CHANGELOG (PRESERVED VERBATIM)
 ================================================================================
+
+v4.0.14-twc - TWC stale data polling optimization
+- FIX: TWC stale data now updates cache timestamp to prevent repeated API calls
+  during upstream lag events. Respects 15s cache TTL instead of polling every loop,
+  reducing unnecessary load on TWC monitor during degraded conditions.
 
 v4.0.13-twc - Wake cache consistency + auth cache structure fix
 - BUG FIX: wake_vehicle_safe() now uses the same cache file path as get_tesla_status()
@@ -73,7 +78,7 @@ Solar Charger - BLE Edition v3.6.6 / v3.6.5 / v3.6.4
 ================================================================================
 """
 
-VERSION = "v4.0.13-twc"
+VERSION = "v4.0.14-twc"
 
 import time
 import subprocess
@@ -285,6 +290,7 @@ def get_twc_connected_safe():
         data_age = j.get('data_age_seconds')
         if data_age and data_age > TWC_STALE_THRESHOLD:
             log(f"TWC data stale ({data_age}s old) -> using cached state")
+            state.twc_cache['ts'] = now  # Update timestamp to prevent spam during stale periods
             return state.twc_cache['value']  # Return cached instead of None
         connected = bool(j.get('connected', False))
         if connected != state.twc_cache.get('last_logged_state'):
