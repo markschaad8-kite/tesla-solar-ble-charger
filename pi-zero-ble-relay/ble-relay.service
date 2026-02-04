@@ -1,0 +1,26 @@
+[Unit]
+Description=Tesla BLE Relay Service
+After=network.target bluetooth.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/pi-zero-ble-relay
+EnvironmentFile=/home/pi/pi-zero-ble-relay/config.env
+ExecStartPre=/usr/bin/sudo /usr/bin/hciconfig hci0 up
+ExecStart=/usr/bin/python3 /home/pi/pi-zero-ble-relay/ble_relay.py
+Restart=always
+RestartSec=10
+
+# Give access to Bluetooth
+SupplementaryGroups=bluetooth
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ble-relay
+
+[Install]
+WantedBy=multi-user.target
