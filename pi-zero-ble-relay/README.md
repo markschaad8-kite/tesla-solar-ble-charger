@@ -14,7 +14,7 @@ relayed through this Pi Zero which should be placed closer to the vehicle.
 ## Network Architecture
 
 ```
-[Pi 5 @ 192.168.x.x]                    [Pi Zero 2 @ 192.168.x.y]
+[Pi 5 @ 192.168.x.x]                      [Pi Zero 2 @ 192.168.x.y]
 ┌─────────────────────┐                   ┌─────────────────────────┐
 │  solar_charger.py   │  HTTP :5003       │    ble_relay.py         │
 │                     │ ───────────────>  │                         │
@@ -81,7 +81,7 @@ This script will:
 
 From your Pi 5, copy the private key:
 ```bash
-scp /path/to/private.pem pi@tesla-ble-relay.local:~/pi-zero-ble-relay/
+scp /path/to/your/private.pem pi@tesla-ble-relay.local:~/pi-zero-ble-relay/
 ```
 
 Set permissions on Pi Zero:
