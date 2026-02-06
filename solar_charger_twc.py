@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
+Solar Charger TWC Fork - v4.0.15-twc - Code review fixes + BLE relay auth
 Solar Charger TWC Fork - v4.0.14-twc - TWC stale data polling optimization
 Solar Charger TWC Fork - v4.0.11-twc - Preconditioning detection (skip amp adjustments during precond)
 Solar Charger TWC Fork - v4.0.10-twc - TWC-only home detection (no GPS fallback)
@@ -19,6 +20,21 @@ Based on: Solar Charger v4.0.10
 ================================================================================
 HISTORICAL CHANGELOG (PRESERVED VERBATIM)
 ================================================================================
+
+v4.0.15-twc - Code review fixes + BLE relay auth
+- FIX: SOLAR_API_BASE default changed from old Pi 2 IP to http://localhost
+- FIX: Emergency mode no longer defaults unknown battery to 50 (threshold boundary).
+  Unknown battery (None) now skips emergency check entirely; inside emergency,
+  unknown battery keeps charging as a safety measure.
+- FIX: BLE relay now receives and uses -domain flag for tesla-control commands
+- SECURITY: BLE relay API key authentication enabled. Charger sends X-API-Key header;
+  relay rejects unauthenticated requests.
+- REFACTOR: Duplicate BLE backoff calculation extracted to calculate_ble_backoff()
+- FIX: TWC status URL now uses explicit TWC_STATUS_URL constant instead of string split
+- FIX: Bare except: in relay check_bluetooth() narrowed to except Exception:
+- CLEANUP: Backup/legacy files moved to backups/ subdirectory
+- DOCS: CLAUDE.md updated to reflect v4.0.14-twc architecture (BLE relay, TWC fork,
+  correct constants, Podman commands, removed GPS references)
 
 v4.0.14-twc - TWC stale data polling optimization
 - FIX: TWC stale data now updates cache timestamp to prevent repeated API calls
@@ -78,7 +94,7 @@ Solar Charger - BLE Edition v3.6.6 / v3.6.5 / v3.6.4
 ================================================================================
 """
 
-VERSION = "v4.0.14-twc"
+VERSION = "v4.0.15-twc"
 
 import time
 import subprocess
@@ -103,13 +119,14 @@ TESLA_EMAIL = os.getenv("TESLA_EMAIL", "your_email@example.com")
 # -------------------------------
 SOLAR_API_BASE = os.getenv(
     "SOLAR_API_BASE",
-    "http://localhost"  # Default to localhost
+    "http://localhost"  # All services on same host since Dec 2025 migration
 )
 
 PI2_SOLAR_URL = f"{SOLAR_API_BASE}:8080/api/envoy_data"
 PI2_CONFIG_URL = f"{SOLAR_API_BASE}:8080/api/charging/config"
 PI2_STATUS_URL = f"{SOLAR_API_BASE}:8080/api/set_charger_status"
 TWC_MONITOR_URL = f"{SOLAR_API_BASE}:5002/api/twc/vehicle_connected"
+TWC_STATUS_URL = f"{SOLAR_API_BASE}:5002/api/twc/status"
 
 # -------------------------------
 # BLE RELAY CONFIG (Pi Zero proxy)
@@ -118,6 +135,7 @@ BLE_RELAY_ENABLED = os.getenv("BLE_RELAY_ENABLED", "true").lower() == "true"
 BLE_RELAY_HOST = os.getenv("BLE_RELAY_HOST", "localhost")
 BLE_RELAY_PORT = int(os.getenv("BLE_RELAY_PORT", "5003"))
 BLE_RELAY_URL = f"http://{BLE_RELAY_HOST}:{BLE_RELAY_PORT}"
+BLE_RELAY_API_KEY = os.getenv("BLE_RELAY_API_KEY", "")
 
 TWC_CACHE_TTL = 15
 TWC_STALE_THRESHOLD = 90
@@ -314,7 +332,7 @@ def get_twc_connected_safe():
 def get_twc_current_amps():
     """Get actual current amps from TWC monitor. Returns None if unavailable."""
     try:
-        r = requests.get(f"{TWC_MONITOR_URL.rsplit('/', 1)[0]}/status", timeout=2.0)
+        r = requests.get(TWC_STATUS_URL, timeout=2.0)
         r.raise_for_status()
         j = r.json()
         return float(j.get('vehicle_current_a', 0))
@@ -545,9 +563,13 @@ def run_tesla_control_via_relay(command, args, domain='infotainment'):
             args = []
 
         # Send to relay with domain for proper flag placement
+        headers = {}
+        if BLE_RELAY_API_KEY:
+            headers['X-API-Key'] = BLE_RELAY_API_KEY
         response = requests.post(
             f"{BLE_RELAY_URL}/ble/command",
             json={'command': command, 'args': args, 'domain': domain},
+            headers=headers,
             timeout=60  # Allow for BLE timeout + network
         )
 
@@ -591,6 +613,12 @@ def log_ble_failure_context():
         pass
 
 
+def calculate_ble_backoff():
+    """Calculate BLE backoff time based on current fail count."""
+    backoff_time = BLE_BACKOFF_INITIAL * min(state.ble_fail_count, 4)
+    return min(backoff_time, BLE_MAX_BACKOFF)
+
+
 def ble_call(cmd, val=None, domain='infotainment'):
     """Execute a BLE command with gating and backoff."""
     if state.ble_command_this_loop:
@@ -628,9 +656,7 @@ def ble_call(cmd, val=None, domain='infotainment'):
         log("BLE >>> Too many BLE connections")
         log_ble_failure_context()
         state.ble_fail_count += 1
-        backoff_time = BLE_BACKOFF_INITIAL * min(state.ble_fail_count, 4)
-        backoff_time = min(backoff_time, BLE_MAX_BACKOFF)
-        state.ble_backoff_until = time.time() + backoff_time
+        state.ble_backoff_until = time.time() + calculate_ble_backoff()
         return False
 
     if ok or "already" in out or "is_charging" in out or "not_charging" in out:
@@ -640,21 +666,19 @@ def ble_call(cmd, val=None, domain='infotainment'):
 
     # Handle failures
     state.ble_fail_count += 1
-    backoff_time = BLE_BACKOFF_INITIAL * min(state.ble_fail_count, 4)
-    backoff_time = min(backoff_time, BLE_MAX_BACKOFF)
 
     if "maximum number of ble" in out or "too many ble" in out:
         log("BLE >>> Too many BLE connections")
         log_ble_failure_context()
-        state.ble_backoff_until = time.time() + backoff_time
+        state.ble_backoff_until = time.time() + calculate_ble_backoff()
     elif "context deadline" in out or "not in bluetooth range" in out:
         log("BLE >>> Car not in range or timeout")
         log_ble_failure_context()
-        state.ble_backoff_until = time.time() + 30
+        state.ble_backoff_until = time.time() + 30  # Short backoff: car just out of range
     else:
         log(f"BLE >>> FAILED: {out[:120]}")
         log_ble_failure_context()
-        state.ble_backoff_until = time.time() + backoff_time
+        state.ble_backoff_until = time.time() + calculate_ble_backoff()
 
     return False
 
@@ -915,7 +939,7 @@ def main():
             now_ts = time.time()
             if (now_ts - state.last_status_check) >= STATUS_CHECK_INTERVAL:
                 battery, charging_state = get_tesla_status()
-            battery = state.cached_battery or 50
+            battery = state.cached_battery
             charging_state = state.cached_charging_state
 
             log(f"MODE: MANUAL - Charging at MAX to {BATTERY_TARGET}%")
@@ -978,7 +1002,7 @@ def main():
         # =====================================================================
         # 2.5) EMERGENCY OVERRIDE (Correct Priority + Hybrid Exit)
         # =====================================================================
-        battery = state.cached_battery or 50
+        battery = state.cached_battery
         charging_state = state.cached_charging_state
 
         if battery is not None and battery < BATTERY_EMERGENCY:
@@ -1000,10 +1024,10 @@ def main():
             if (time.time() - state.cached_ts) >= EMERGENCY_STATUS_INTERVAL:
                 log("EMERGENCY: forcing fresh Tesla status check")
                 battery, charging_state = get_tesla_status()
-                battery = state.cached_battery or 50
+                battery = state.cached_battery
                 charging_state = state.cached_charging_state
 
-                if battery >= BATTERY_EMERGENCY:
+                if battery is not None and battery >= BATTERY_EMERGENCY:
                     log(f"EMERGENCY: battery recovered to {battery}% (>= {BATTERY_EMERGENCY}%) -> exiting emergency")
                     state.emergency_start_ts = None
 
@@ -1158,7 +1182,7 @@ def main():
         if (now_ts - state.last_status_check) >= STATUS_CHECK_INTERVAL:
             battery, charging_state = get_tesla_status()
 
-        battery = state.cached_battery or 50
+        battery = state.cached_battery
         charging_state = state.cached_charging_state
 
         # ========================================

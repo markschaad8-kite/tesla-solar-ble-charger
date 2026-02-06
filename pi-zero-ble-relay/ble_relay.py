@@ -64,7 +64,7 @@ def run_tesla_control(command, args=None, domain='infotainment'):
     Args:
         command: The tesla-control command (e.g., 'charging-set-amps')
         args: List of arguments (e.g., ['20'])
-        domain: BLE domain ('infotainment' or 'vcsec')
+        domain: Command domain (e.g., 'infotainment', 'vcsec')
 
     Returns:
         tuple: (success: bool, output: str, duration: float)
@@ -74,8 +74,8 @@ def run_tesla_control(command, args=None, domain='infotainment'):
 
     cmd = [
         TESLA_CONTROL_PATH,
-        '-ble',
         '-domain', domain,
+        '-ble',
         '-key-file', KEY_FILE,
         '-vin', VIN,
         command
@@ -115,7 +115,7 @@ def check_bluetooth():
             timeout=5
         )
         return 'UP RUNNING' in result.stdout
-    except:
+    except Exception:
         return False
 
 
@@ -187,7 +187,7 @@ def ble_command():
 
     # Log the request
     cmd_str = f"{command} {' '.join(str(a) for a in args)}".strip()
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] BLE command: {cmd_str} (domain={domain})")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] BLE command: {cmd_str} ({domain})")
 
     # Execute the command
     success, output, duration = run_tesla_control(command, args, domain)
