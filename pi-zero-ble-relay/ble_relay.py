@@ -165,8 +165,7 @@ def ble_command():
     Request body:
     {
         "command": "charging-set-amps",
-        "args": ["20"],
-        "domain": "infotainment"  // optional, defaults to "infotainment"
+        "args": ["20"]
     }
     """
     # Check API key if configured

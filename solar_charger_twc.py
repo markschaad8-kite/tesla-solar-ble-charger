@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
+Solar Charger TWC Fork - v4.0.16-twc - Smart calendar timing + 80% approval gate
 Solar Charger TWC Fork - v4.0.15-twc - Code review fixes + BLE relay auth
 Solar Charger TWC Fork - v4.0.14-twc - TWC stale data polling optimization
 Solar Charger TWC Fork - v4.0.11-twc - Preconditioning detection (skip amp adjustments during precond)
@@ -20,6 +21,15 @@ Based on: Solar Charger v4.0.10
 ================================================================================
 HISTORICAL CHANGELOG (PRESERVED VERBATIM)
 ================================================================================
+
+v4.0.16-twc - Smart calendar timing + 80% approval gate
+- FEATURE: charge_after timing — CALENDAR mode waits until calculated start time
+  instead of charging immediately when advisory is written. Falls through to SOLAR
+  while waiting. All-day events assume 7 AM departure.
+- FEATURE: 80% approval gate — targets >80% pause at 80% and wait for user approval
+  via dashboard button. Auto-approves if <2 hours before event.
+- FEATURE: CALENDAR_WAITING mode — visible on dashboard while waiting for charge_after
+- REFACTOR: calendar_checker.py gains calculate_charge_after() and approve_above_80()
 
 v4.0.15-twc - Code review fixes + BLE relay auth
 - FIX: SOLAR_API_BASE default changed from old Pi 2 IP to http://localhost
@@ -94,7 +104,7 @@ Solar Charger - BLE Edition v3.6.6 / v3.6.5 / v3.6.4
 ================================================================================
 """
 
-VERSION = "v4.0.15-twc"
+VERSION = "v4.0.16-twc"
 
 import time
 import subprocess
@@ -107,19 +117,19 @@ from typing import Optional, Deque, Dict, Any
 
 
 # -------------------------------
-# CONFIG - Set via environment variables
+# CONFIG (unchanged)
 # -------------------------------
-VIN = os.getenv("TESLA_VIN", "YOUR_VIN_HERE")
-KEY_FILE = os.getenv("TESLA_KEY_FILE", "/app/private.pem")
-CACHE_FILE = os.getenv("TESLA_CACHE_FILE", "/app/cache.json")
-TESLA_EMAIL = os.getenv("TESLA_EMAIL", "your_email@example.com")
+VIN = "YOUR_VIN_HERE"
+KEY_FILE = "/app/private.pem"
+CACHE_FILE = "/app/cache.json"
+TESLA_EMAIL = "your_email@example.com"
 
 # -------------------------------
-# NETWORK CONFIG
+# NETWORK CONFIG (Stage 1 migration prep)
 # -------------------------------
 SOLAR_API_BASE = os.getenv(
     "SOLAR_API_BASE",
-    "http://localhost"  # All services on same host since Dec 2025 migration
+    "http://localhost"  # All services on same Pi since migration
 )
 
 PI2_SOLAR_URL = f"{SOLAR_API_BASE}:8080/api/envoy_data"
@@ -132,10 +142,10 @@ TWC_STATUS_URL = f"{SOLAR_API_BASE}:5002/api/twc/status"
 # BLE RELAY CONFIG (Pi Zero proxy)
 # -------------------------------
 BLE_RELAY_ENABLED = os.getenv("BLE_RELAY_ENABLED", "true").lower() == "true"
-BLE_RELAY_HOST = os.getenv("BLE_RELAY_HOST", "localhost")
+BLE_RELAY_HOST = os.getenv("BLE_RELAY_HOST", "SolarPiZero")
 BLE_RELAY_PORT = int(os.getenv("BLE_RELAY_PORT", "5003"))
 BLE_RELAY_URL = f"http://{BLE_RELAY_HOST}:{BLE_RELAY_PORT}"
-BLE_RELAY_API_KEY = os.getenv("BLE_RELAY_API_KEY", "")
+BLE_RELAY_API_KEY = os.getenv("BLE_RELAY_API_KEY", "YOUR_API_KEY_HERE")
 
 TWC_CACHE_TTL = 15
 TWC_STALE_THRESHOLD = 90
@@ -147,7 +157,7 @@ MIN_SOLAR_PRODUCTION = 100
 MIN_AMPS = 6
 MAX_AMPS = 48
 BATTERY_EMERGENCY = 50
-BATTERY_TARGET = 80
+DEFAULT_BATTERY_TARGET = 80
 
 LOOP_INTERVAL = 30
 STATUS_CHECK_INTERVAL = 300
@@ -198,6 +208,8 @@ class ChargerState:
     last_low_prod_time: Optional[float] = None
     night_stop_sent: bool = False
     last_manual_state: bool = False
+    last_calendar_mode: bool = False
+    calendar_reason: Optional[str] = None
 
     # BLE state
     ble_command_this_loop: bool = False
@@ -218,11 +230,14 @@ class ChargerState:
     # Wake escalation state
     manual_ble_fails: int = 0
     solar_ble_fails: int = 0
+    calendar_ble_fails: int = 0
     last_wake_attempt_manual: float = 0.0
     last_wake_attempt_solar: float = 0.0
+    last_wake_attempt_calendar: float = 0.0
 
     # Emergency tracking
     emergency_start_ts: Optional[float] = None
+    emergency_start_battery: Optional[int] = None
 
     # Session tracking
     session_start_ts: Optional[float] = None
@@ -278,6 +293,7 @@ def reset_away_mode_state():
     state.manual_ble_fails = 0
     state.ble_fail_count = 0
     state.emergency_start_ts = None
+    state.emergency_start_battery = None
 
 
 def reset_session_state():
@@ -404,7 +420,8 @@ def update_dashboard_status(mode, amps, target_amps, battery, excess_watts, prod
             'ble_backoff_until': state.ble_backoff_until,
             'ble_backoff_remaining': max(0, int(state.ble_backoff_until - time.time())),
             'grid_charge_warning_amps': state.grid_charge_warning_amps,
-            'is_preconditioning': state.cached_is_preconditioning
+            'is_preconditioning': state.cached_is_preconditioning,
+            'calendar_reason': state.calendar_reason
         }
         requests.post(PI2_STATUS_URL, json=payload, timeout=3)
     except Exception as e:
@@ -462,6 +479,16 @@ def get_tesla_status():
 # -------------------------------
 # Wake escalation (MANUAL only)
 # -------------------------------
+def _set_wake_cooldown(reason: str, now: float):
+    """Set wake cooldown timestamp for the given reason."""
+    if reason == 'solar':
+        state.last_wake_attempt_solar = now
+    elif reason == 'calendar':
+        state.last_wake_attempt_calendar = now
+    else:
+        state.last_wake_attempt_manual = now
+
+
 def wake_vehicle_safe(reason: str = 'manual'):
     """
     Wake car via Tesla API with cooldown.
@@ -473,6 +500,8 @@ def wake_vehicle_safe(reason: str = 'manual'):
     # Select appropriate cooldown based on reason
     if reason == 'solar':
         last_attempt = state.last_wake_attempt_solar
+    elif reason == 'calendar':
+        last_attempt = state.last_wake_attempt_calendar
     else:
         last_attempt = state.last_wake_attempt_manual
 
@@ -487,32 +516,20 @@ def wake_vehicle_safe(reason: str = 'manual'):
             vehicles = tesla.vehicle_list()
             if not vehicles:
                 log(f"Wake failed [{reason}]: no vehicles found")
-                # Set cooldown for this reason
-                if reason == 'solar':
-                    state.last_wake_attempt_solar = now
-                else:
-                    state.last_wake_attempt_manual = now
+                _set_wake_cooldown(reason, now)
                 return False
 
             vehicle = vehicles[0]
             log(f"Escalation [{reason}]: sending Tesla API wake...")
             vehicle.sync_wake_up()
 
-            # Set cooldown for this reason
-            if reason == 'solar':
-                state.last_wake_attempt_solar = now
-            else:
-                state.last_wake_attempt_manual = now
+            _set_wake_cooldown(reason, now)
 
             log("Wake request sent successfully")
             return True
     except Exception as e:
         log(f"Wake failed [{reason}]: {e}")
-        # Set cooldown for this reason
-        if reason == 'solar':
-            state.last_wake_attempt_solar = now
-        else:
-            state.last_wake_attempt_manual = now
+        _set_wake_cooldown(reason, now)
         return False
 
 # -------------------------------
@@ -801,11 +818,15 @@ def main():
             state.session_start_ts = None
             state.session_peak_amps = 0
 
-            log(f"🔌 TWC DISCONNECT EDGE - normalize amps to {MAX_AMPS}A (destination-friendly)")
+            log(f"🔌 TWC DISCONNECT EDGE - normalize amps to {MAX_AMPS}A + limit to {DEFAULT_BATTERY_TARGET}%")
 
             if ble_allowed():
                 ok = set_charging_amps(MAX_AMPS)
-                if not ok:
+                if ok:
+                    time.sleep(5)
+                    if ble_allowed():
+                        set_charge_limit(DEFAULT_BATTERY_TARGET)
+                else:
                     state.pending_disconnect_amp_normalization = True
                     state.pending_disconnect_reason = "BLE attempt failed on disconnect edge"
                     log("  └─ Disconnect normalize failed; will retry once on next connect")
@@ -830,6 +851,9 @@ def main():
                     ok = set_charging_amps(MAX_AMPS)
                     if ok:
                         log("  └─ Pending normalize retry succeeded")
+                        time.sleep(5)
+                        if ble_allowed():
+                            set_charge_limit(DEFAULT_BATTERY_TARGET)
                     else:
                         log("  └─ Pending normalize retry failed")
                 else:
@@ -942,7 +966,7 @@ def main():
             battery = state.cached_battery
             charging_state = state.cached_charging_state
 
-            log(f"MODE: MANUAL - Charging at MAX to {BATTERY_TARGET}%")
+            log(f"MODE: MANUAL - Charging at MAX to {DEFAULT_BATTERY_TARGET}%")
 
             # Skip BLE commands if charging is complete (car reached target)
             if charging_state == 'Complete':
@@ -1010,7 +1034,8 @@ def main():
 
             if state.emergency_start_ts is None:
                 state.emergency_start_ts = time.time()
-                log("EMERGENCY: entered (tracking start time)")
+                state.emergency_start_battery = battery
+                log(f"EMERGENCY: entered at {battery}% (tracking start time)")
 
             elapsed = time.time() - state.emergency_start_ts
             remaining = max(0, MAX_EMERGENCY_RUNTIME - elapsed)
@@ -1030,11 +1055,18 @@ def main():
                 if battery is not None and battery >= BATTERY_EMERGENCY:
                     log(f"EMERGENCY: battery recovered to {battery}% (>= {BATTERY_EMERGENCY}%) -> exiting emergency")
                     state.emergency_start_ts = None
+                    state.emergency_start_battery = None
 
             if state.emergency_start_ts is not None:
                 if elapsed >= MAX_EMERGENCY_RUNTIME:
-                    log("EMERGENCY: fallback runtime reached -> exiting emergency (conservative)")
-                    state.emergency_start_ts = None
+                    if battery is not None and state.emergency_start_battery is not None and battery > state.emergency_start_battery:
+                        log(f"EMERGENCY: 90min elapsed but battery rising ({state.emergency_start_battery}% -> {battery}%) — continuing")
+                        state.emergency_start_ts = time.time()
+                        state.emergency_start_battery = battery
+                    else:
+                        log("EMERGENCY: 90min elapsed and battery not rising -> exiting (conservative)")
+                        state.emergency_start_ts = None
+                        state.emergency_start_battery = None
                 else:
                     if state.current_amps != MAX_AMPS:
                         if ble_allowed():
@@ -1046,9 +1078,9 @@ def main():
                             start_charging()
                         else:
                             log("EMERGENCY: need to start charging but BLE gated; will retry next loop")
-                    elif state.last_charge_limit_set != BATTERY_TARGET:
+                    elif state.last_charge_limit_set != DEFAULT_BATTERY_TARGET:
                         if ble_allowed():
-                            set_charge_limit(BATTERY_TARGET)
+                            set_charge_limit(DEFAULT_BATTERY_TARGET)
                         else:
                             log("EMERGENCY: need to set limit but BLE gated; will retry next loop")
 
@@ -1090,6 +1122,170 @@ def main():
                     continue
         else:
             state.emergency_start_ts = None
+
+        # =====================================================================
+        # 2.7) CALENDAR MODE CHECK (between EMERGENCY and NIGHT)
+        # =====================================================================
+        calendar_advisory = dashboard_config.get('calendar_advisory')
+        calendar_active = (
+            calendar_advisory
+            and calendar_advisory.get('active')
+            and not calendar_advisory.get('dismissed')
+            and time.time() < calendar_advisory.get('expires_at', 0)
+        )
+
+        if calendar_active:
+            cal_target = calendar_advisory.get('battery_target', DEFAULT_BATTERY_TARGET)
+
+            # Step A: charge_after timing gate
+            charge_after = calendar_advisory.get('charge_after')
+            if charge_after and time.time() < charge_after:
+                hours_left = (charge_after - time.time()) / 3600
+                mode = 'CALENDAR_WAITING'
+                state.calendar_reason = calendar_advisory.get('friendly_message')
+                if not state.last_calendar_mode:
+                    log(f"CALENDAR_WAITING: {calendar_advisory.get('friendly_message', 'Trip detected')}")
+                    state.last_calendar_mode = True
+                log(f"CALENDAR_WAITING: {hours_left:.1f}h until charging starts — running SOLAR")
+                # Fall through to SOLAR mode below (don't continue)
+            elif battery is None:
+                # Battery unknown — need to wake car to get status
+                mode = 'CALENDAR'
+                if not state.last_calendar_mode:
+                    log(f"CALENDAR: {calendar_advisory.get('friendly_message', 'Trip detected')}")
+                    log(f"CALENDAR: Battery unknown — waking vehicle to get status")
+                    state.last_calendar_mode = True
+                    state.calendar_reason = calendar_advisory.get('friendly_message')
+                state.calendar_ble_fails += 1
+                if state.calendar_ble_fails >= BLE_FAILS_BEFORE_WAKE:
+                    log(f"CALENDAR: Battery unknown + {state.calendar_ble_fails} BLE fails — escalating to API wake")
+                    wake_vehicle_safe('calendar')
+                    state.calendar_ble_fails = 0
+                # Fall through — will retry next loop once vehicle responds
+            elif battery < cal_target:
+                # Step B: 80% approval gate
+                above_80_approved = calendar_advisory.get('above_80_approved', False)
+                effective_target = cal_target
+
+                if cal_target > 80 and not above_80_approved:
+                    # Auto-approve if <2 hours before event
+                    event_start_iso = calendar_advisory.get('event_start_iso', '')
+                    try:
+                        event_ts = datetime.fromisoformat(
+                            event_start_iso.replace("Z", "+00:00")
+                        ).timestamp()
+                    except Exception:
+                        event_ts = calendar_advisory.get('expires_at', 0)
+                    hours_to_event = (event_ts - time.time()) / 3600
+
+                    if hours_to_event < 2:
+                        log(f"CALENDAR: Auto-approving above-80% ({hours_to_event:.1f}h to event)")
+                        above_80_approved = True
+                        # Persist auto-approval so dashboard sees it
+                        try:
+                            cfg_path = f"{SOLAR_API_BASE}:8080/api/calendar/approve_above_80"
+                            requests.post(cfg_path, json={}, timeout=3)
+                        except Exception:
+                            pass  # Best-effort; charger will keep re-approving
+
+                    if not above_80_approved:
+                        effective_target = 80
+
+                if battery < effective_target:
+                    mode = 'CALENDAR'
+
+                    if not state.last_calendar_mode:
+                        log(f"CALENDAR: {calendar_advisory.get('friendly_message', 'Trip detected')}")
+                        log(f"CALENDAR: Charging to {effective_target}% (current: {battery}%)")
+                        state.last_calendar_mode = True
+                        state.calendar_reason = calendar_advisory.get('friendly_message')
+                        state.last_charge_limit_set = None  # Force charge limit update
+
+                    # Set charge limit to effective target
+                    if state.last_charge_limit_set != effective_target:
+                        if ble_allowed():
+                            set_charge_limit(effective_target)
+                        else:
+                            log("CALENDAR: need to set limit but BLE gated; will retry next loop")
+
+                    # Charge at maximum amps (same pattern as MANUAL/EMERGENCY)
+                    if state.current_amps != MAX_AMPS:
+                        if ble_allowed():
+                            set_charging_amps(MAX_AMPS)
+                        else:
+                            log("CALENDAR: need MAX amps but BLE gated; will retry next loop")
+                    elif charging_state != 'Charging':
+                        if ble_allowed():
+                            start_charging()
+                        else:
+                            log("CALENDAR: need to start charging but BLE gated; will retry next loop")
+
+                    # Wake escalation (same pattern as MANUAL mode)
+                    ble_succeeded = state.ble_command_this_loop and state.ble_fail_count == 0
+                    if ble_succeeded:
+                        state.calendar_ble_fails = 0
+                    elif state.ble_attempted_this_loop:
+                        state.calendar_ble_fails += 1
+                        log(f"CALENDAR BLE fail streak: {state.calendar_ble_fails}")
+
+                        # Fast wake: first fail + vehicle asleep = wake immediately
+                        if state.calendar_ble_fails == 1 and not state.cached_vehicle_online:
+                            log("CALENDAR: Vehicle asleep -> immediate wake + retry")
+                            if wake_vehicle_safe('calendar'):
+                                time.sleep(20)
+                                state.ble_command_this_loop = False
+                                state.ble_backoff_until = 0
+                                if set_charge_limit(effective_target):
+                                    state.calendar_ble_fails = 0
+
+                    if twc_state is True and state.calendar_ble_fails >= BLE_FAILS_BEFORE_WAKE:
+                        log(f"CALENDAR: BLE failed {state.calendar_ble_fails}x while connected - escalating to API wake")
+                        wake_vehicle_safe('calendar')
+                        log("CALENDAR wake escalation attempted; resetting BLE failure counters")
+                        state.calendar_ble_fails = 0
+                        state.ble_fail_count = 0
+
+                    solar = get_solar_data()
+                    excess_val = solar['excess'] if solar else 0
+                    prod_val = solar['production'] if solar else 0
+                    update_dashboard_status(
+                        mode, state.current_amps, MAX_AMPS, battery,
+                        excess_val, prod_val, charging_state or 'Charging'
+                    )
+
+                    log(f"Loop duration: {time.time() - loop_start_ts:.1f}s")
+                    time.sleep(LOOP_INTERVAL)
+                    continue
+                elif effective_target < cal_target:
+                    # Paused at 80%, waiting for user approval
+                    mode = 'CALENDAR'
+                    state.calendar_reason = f"Paused at 80% — approve charging to {cal_target}%"
+                    log(f"CALENDAR: Paused at 80% — awaiting approval to charge to {cal_target}%")
+                    solar = get_solar_data()
+                    excess_val = solar['excess'] if solar else 0
+                    prod_val = solar['production'] if solar else 0
+                    update_dashboard_status(
+                        mode, 0, cal_target, battery,
+                        excess_val, prod_val, 'Stopped'
+                    )
+                    # Fall through to SOLAR mode
+                else:
+                    # Battery at/above full target -- fall through to SOLAR
+                    if state.last_calendar_mode:
+                        log(f"CALENDAR: Battery {battery}% >= {cal_target}% target -- returning to SOLAR")
+                        state.last_calendar_mode = False
+                        state.calendar_reason = None
+            else:
+                # Battery already at/above target -- fall through to SOLAR
+                if state.last_calendar_mode:
+                    log(f"CALENDAR: Battery {battery}% >= {cal_target}% target -- returning to SOLAR")
+                    state.last_calendar_mode = False
+                    state.calendar_reason = None
+        else:
+            if state.last_calendar_mode:
+                log("CALENDAR: Advisory expired or dismissed -- returning to SOLAR")
+                state.last_calendar_mode = False
+                state.calendar_reason = None
 
         # ========================================
         # 3) GET SOLAR DATA & SMOOTH
@@ -1188,7 +1384,8 @@ def main():
         # ========================================
         # 7) SOLAR MODE
         # ========================================
-        mode = 'SOLAR'
+        if mode not in ('CALENDAR_WAITING',):
+            mode = 'SOLAR'
 
         # [NEW] High Solar Wake-Up
         # If we have strong sustained solar excess but the car is not charging,
@@ -1253,8 +1450,8 @@ def main():
                             set_charging_amps(banded_target)
                         elif charging_state != 'Charging' and ble_allowed():
                             start_charging()
-                        elif state.last_charge_limit_set != BATTERY_TARGET and ble_allowed():
-                            set_charge_limit(BATTERY_TARGET)
+                        elif state.last_charge_limit_set != DEFAULT_BATTERY_TARGET and ble_allowed():
+                            set_charge_limit(DEFAULT_BATTERY_TARGET)
             else:
                 log(f"Stable at {state.current_amps}A, target {banded_target}A within threshold")
         else:
