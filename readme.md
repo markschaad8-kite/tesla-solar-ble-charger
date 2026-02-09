@@ -10,7 +10,7 @@ Automated Tesla charging control running on Raspberry Pi. Adjusts charging amper
 * **Calendar-Aware Charging (v4.0.16):** Reads Google Calendar for upcoming trips with locations. An AI assessment determines round-trip distance and recommends a battery target (80-95%). Smart timing calculates when to start charging based on departure time minus estimated charge duration.
 * **80% Approval Gate (v4.0.16):** When calendar targets exceed 80%, charging pauses at 80% and waits for user approval via the dashboard (battery health protection). Auto-approves if less than 2 hours before the event.
 * **Preconditioning Detection (v4.0.11):** Detects when the vehicle is preconditioning (climate prep) and skips amp adjustments to avoid interfering with the vehicle's thermal management.
-* **Emergency Mode:** If battery drops below 50%, overrides all other modes and charges at full speed (48A). Monitors progress and continues past 90-minute fallback if battery is still rising.
+* **Emergency Mode:** If battery drops below 50%, overrides all other modes and charges at full speed (48A) until 50%. Monitors progress and continues past 90-minute fallback if battery is still rising.
 * **Smart Disconnect:** Automatically resets the car to 48A when unplugged, so plugging back in resumes at max rate. Handles BLE cooldown edge cases with pending normalization.
 * **Zero-Grid Drain:** Night mode automatically stops charging when solar production drops below 100W for 10 minutes.
 * **Solar Takeover (v4.0.8):** Dashboard button to force solar control when external charging is detected.
@@ -20,10 +20,10 @@ Automated Tesla charging control running on Raspberry Pi. Adjusts charging amper
 
 | Mode | Priority | Trigger | Behavior |
 |------|----------|---------|----------|
-| **EMERGENCY** | Highest | Battery < 50% | Charge at 48A until 80%. Continues past 90-min timeout if battery still rising. |
+| **EMERGENCY** | Highest | Battery < 50% | Charge at 48A until 50%. Continues past 90-min timeout if battery still rising. |
 | **CALENDAR** | High | Active trip advisory | Charge at 48A to advisory target. Pauses at 80% if target > 80% (approval gate). |
 | **CALENDAR_WAITING** | - | Advisory active, before charge_after time | Shows countdown on dashboard, falls through to SOLAR. |
-| **MANUAL** | Medium | User-enabled via dashboard | Charge at configured amps regardless of solar. Wake escalation after 3 BLE fails. |
+| **MANUAL** | Medium | User-enabled via dashboard | Charge at 48A to 80% regardless of solar. Wake escalation after 3 BLE fails. |
 | **SOLAR** | Normal | Excess solar > 100W | Adjusts amps to match solar excess (6-48A). Hysteresis prevents micro-adjustments. |
 | **NIGHT_STOP** | Low | Solar < 100W for 10 min | Stops charging, resumes at sunrise. |
 | **AWAY** | - | TWC disconnected | Idle, waiting for vehicle to return home. |
