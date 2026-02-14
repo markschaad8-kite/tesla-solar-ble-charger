@@ -129,7 +129,7 @@ TESLA_EMAIL = "your_email@example.com"
 # -------------------------------
 SOLAR_API_BASE = os.getenv(
     "SOLAR_API_BASE",
-    "http://localhost"  # All services on same Pi since migration
+    "http://localhost"  # All services on pinasi (Pi 5) since Dec 2025 migration
 )
 
 PI2_SOLAR_URL = f"{SOLAR_API_BASE}:8080/api/envoy_data"
@@ -142,7 +142,7 @@ TWC_STATUS_URL = f"{SOLAR_API_BASE}:5002/api/twc/status"
 # BLE RELAY CONFIG (Pi Zero proxy)
 # -------------------------------
 BLE_RELAY_ENABLED = os.getenv("BLE_RELAY_ENABLED", "true").lower() == "true"
-BLE_RELAY_HOST = os.getenv("BLE_RELAY_HOST", "SolarPiZero")
+BLE_RELAY_HOST = os.getenv("BLE_RELAY_HOST", "your-ble-relay-host")
 BLE_RELAY_PORT = int(os.getenv("BLE_RELAY_PORT", "5003"))
 BLE_RELAY_URL = f"http://{BLE_RELAY_HOST}:{BLE_RELAY_PORT}"
 BLE_RELAY_API_KEY = os.getenv("BLE_RELAY_API_KEY", "YOUR_API_KEY_HERE")
@@ -968,10 +968,18 @@ def main():
 
             log(f"MODE: MANUAL - Charging at MAX to {DEFAULT_BATTERY_TARGET}%")
 
-            # Skip BLE commands if charging is complete (car reached target)
-            if charging_state == 'Complete':
+            # Skip BLE commands if charging is genuinely complete (at/above target)
+            if charging_state == 'Complete' and battery is not None and battery >= DEFAULT_BATTERY_TARGET:
                 log("MANUAL: Charging complete - skipping BLE commands")
                 ble_succeeded = True
+            elif charging_state == 'Complete':
+                # Car hit a lower charge limit (e.g. from CALENDAR) — raise it
+                log(f"MANUAL: Car Complete at {battery}% but target is "
+                    f"{DEFAULT_BATTERY_TARGET}% — raising limit")
+                if ble_allowed():
+                    ble_succeeded = set_charge_limit(DEFAULT_BATTERY_TARGET)
+                else:
+                    ble_succeeded = False
             elif state.current_amps != MAX_AMPS:
                 ble_succeeded = set_charging_amps(MAX_AMPS)
             elif charging_state != 'Charging' and ble_allowed():
@@ -1127,6 +1135,8 @@ def main():
         # 2.7) CALENDAR MODE CHECK (between EMERGENCY and NIGHT)
         # =====================================================================
         calendar_advisory = dashboard_config.get('calendar_advisory')
+        was_in_calendar = state.last_calendar_mode
+
         calendar_active = (
             calendar_advisory
             and calendar_advisory.get('active')
@@ -1141,12 +1151,15 @@ def main():
             charge_after = calendar_advisory.get('charge_after')
             if charge_after and time.time() < charge_after:
                 hours_left = (charge_after - time.time()) / 3600
-                mode = 'CALENDAR_WAITING'
-                state.calendar_reason = calendar_advisory.get('friendly_message')
-                if not state.last_calendar_mode:
-                    log(f"CALENDAR_WAITING: {calendar_advisory.get('friendly_message', 'Trip detected')}")
-                    state.last_calendar_mode = True
-                log(f"CALENDAR_WAITING: {hours_left:.1f}h until charging starts — running SOLAR")
+                # Only show CALENDAR_WAITING within 1 hour of charge time
+                # Before that, just run as SOLAR (advisory banner is visible anyway)
+                if hours_left <= 1.0:
+                    mode = 'CALENDAR_WAITING'
+                    state.calendar_reason = calendar_advisory.get('friendly_message')
+                    if not state.last_calendar_mode:
+                        log(f"CALENDAR_WAITING: {calendar_advisory.get('friendly_message', 'Trip detected')}")
+                        state.last_calendar_mode = True
+                    log(f"CALENDAR_WAITING: {hours_left:.1f}h until charging starts — running SOLAR")
                 # Fall through to SOLAR mode below (don't continue)
             elif battery is None:
                 # Battery unknown — need to wake car to get status
@@ -1286,6 +1299,33 @@ def main():
                 log("CALENDAR: Advisory expired or dismissed -- returning to SOLAR")
                 state.last_calendar_mode = False
                 state.calendar_reason = None
+
+        # If we just exited CALENDAR mode, reset for SOLAR charging
+        if was_in_calendar and not state.last_calendar_mode:
+            state.current_amps = 0  # Force SOLAR to recalculate from scratch
+            if (state.last_charge_limit_set is not None
+                    and state.last_charge_limit_set < DEFAULT_BATTERY_TARGET):
+                log(f"CALENDAR exit: resetting charge limit "
+                    f"{state.last_charge_limit_set}% -> {DEFAULT_BATTERY_TARGET}%")
+                if ble_allowed():
+                    set_charge_limit(DEFAULT_BATTERY_TARGET)
+                else:
+                    state.last_charge_limit_set = None  # Ensure retry
+
+        # If car is Complete below target, reset stale amps and raise charge limit
+        if (charging_state == 'Complete'
+                and battery is not None
+                and battery < DEFAULT_BATTERY_TARGET):
+            if state.current_amps > 0:
+                log(f"Car Complete at {battery}% but current_amps was "
+                    f"{state.current_amps} — resetting to 0")
+                state.current_amps = 0
+            if ((state.last_charge_limit_set is None
+                    or state.last_charge_limit_set < DEFAULT_BATTERY_TARGET)
+                    and ble_allowed()):
+                log(f"SOLAR: Raising charge limit to {DEFAULT_BATTERY_TARGET}% "
+                    f"(car Complete at {battery}%)")
+                set_charge_limit(DEFAULT_BATTERY_TARGET)
 
         # ========================================
         # 3) GET SOLAR DATA & SMOOTH
@@ -1462,6 +1502,17 @@ def main():
 
         if state.current_amps > 0 and charging_state not in ('Charging', 'Complete') and ble_allowed():
             log("Car not charging but amps > 0 -> starting charging")
+            start_charging()
+
+        # If car is Complete below target with limit already raised, restart
+        if (charging_state == 'Complete'
+                and battery is not None
+                and battery < DEFAULT_BATTERY_TARGET
+                and state.last_charge_limit_set is not None
+                and state.last_charge_limit_set >= DEFAULT_BATTERY_TARGET
+                and ble_allowed()):
+            log(f"SOLAR: Car Complete at {battery}% — restarting "
+                f"(limit is {state.last_charge_limit_set}%)")
             start_charging()
 
         if state.current_amps > 0 and charging_state == 'Charging':
