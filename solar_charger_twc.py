@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
+Solar Charger TWC Fork - v4.0.17-twc - Fix EMERGENCY fallthrough to SOLAR after 90min reset
 Solar Charger TWC Fork - v4.0.16-twc - Smart calendar timing + 80% approval gate
 Solar Charger TWC Fork - v4.0.15-twc - Code review fixes + BLE relay auth
 Solar Charger TWC Fork - v4.0.14-twc - TWC stale data polling optimization
@@ -21,6 +22,12 @@ Based on: Solar Charger v4.0.10
 ================================================================================
 HISTORICAL CHANGELOG (PRESERVED VERBATIM)
 ================================================================================
+
+v4.0.17-twc - Fix EMERGENCY fallthrough to SOLAR after 90min reset
+- BUG FIX: When EMERGENCY mode hit the 90-min timeout with battery still rising,
+  it logged "continuing" and reset the timer but was missing a `continue` statement.
+  This caused the loop to fall through into SOLAR logic for one iteration, sending
+  a reduced SOLAR amp command instead of staying at 48A.
 
 v4.0.16-twc - Smart calendar timing + 80% approval gate
 - FEATURE: charge_after timing — CALENDAR mode waits until calculated start time
@@ -119,10 +126,10 @@ from typing import Optional, Deque, Dict, Any
 # -------------------------------
 # CONFIG (unchanged)
 # -------------------------------
-VIN = "YOUR_VIN_HERE"
+VIN = os.getenv("TESLA_VIN", "")
 KEY_FILE = "/app/private.pem"
 CACHE_FILE = "/app/cache.json"
-TESLA_EMAIL = "your_email@example.com"
+TESLA_EMAIL = "YOUR_TESLA_EMAIL@example.com"
 
 # -------------------------------
 # NETWORK CONFIG (Stage 1 migration prep)
@@ -142,10 +149,10 @@ TWC_STATUS_URL = f"{SOLAR_API_BASE}:5002/api/twc/status"
 # BLE RELAY CONFIG (Pi Zero proxy)
 # -------------------------------
 BLE_RELAY_ENABLED = os.getenv("BLE_RELAY_ENABLED", "true").lower() == "true"
-BLE_RELAY_HOST = os.getenv("BLE_RELAY_HOST", "your-ble-relay-host")
+BLE_RELAY_HOST = os.getenv("BLE_RELAY_HOST", "SolarPiZero")
 BLE_RELAY_PORT = int(os.getenv("BLE_RELAY_PORT", "5003"))
 BLE_RELAY_URL = f"http://{BLE_RELAY_HOST}:{BLE_RELAY_PORT}"
-BLE_RELAY_API_KEY = os.getenv("BLE_RELAY_API_KEY", "YOUR_API_KEY_HERE")
+BLE_RELAY_API_KEY = os.getenv("BLE_RELAY_API_KEY", "YOUR_BLE_RELAY_API_KEY")
 
 TWC_CACHE_TTL = 15
 TWC_STALE_THRESHOLD = 90
@@ -844,6 +851,11 @@ def main():
             log("📊 SESSION STARTED: tracking begins")
             log(f"🔋 New session: resetting BLE + emergency state")
 
+            # Invalidate stale Tesla status — new session needs fresh data
+            state.cached_ts = 0.0
+            state.cached_charging_state = None
+            log("  └─ Invalidated Tesla cache (forces fresh API query)")
+
             # One-time retry of disconnect normalization if needed
             if state.pending_disconnect_amp_normalization:
                 log(f"🔁 Pending disconnect normalize retry ({state.pending_disconnect_reason})")
@@ -1071,6 +1083,7 @@ def main():
                         log(f"EMERGENCY: 90min elapsed but battery rising ({state.emergency_start_battery}% -> {battery}%) — continuing")
                         state.emergency_start_ts = time.time()
                         state.emergency_start_battery = battery
+                        continue
                     else:
                         log("EMERGENCY: 90min elapsed and battery not rising -> exiting (conservative)")
                         state.emergency_start_ts = None
