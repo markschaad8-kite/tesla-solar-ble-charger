@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
+Solar Charger TWC Fork - v4.0.18-twc - Fix EMERGENCY exit/night/wake/session bugs
 Solar Charger TWC Fork - v4.0.17-twc - Fix EMERGENCY fallthrough to SOLAR after 90min reset
 Solar Charger TWC Fork - v4.0.16-twc - Smart calendar timing + 80% approval gate
 Solar Charger TWC Fork - v4.0.15-twc - Code review fixes + BLE relay auth
@@ -22,6 +23,23 @@ Based on: Solar Charger v4.0.10
 ================================================================================
 HISTORICAL CHANGELOG (PRESERVED VERBATIM)
 ================================================================================
+
+v4.0.18-twc - Fix EMERGENCY exit/night/wake/session bugs (5 bugs fixed)
+- BUG FIX (Critical): Battery recovery exit from EMERGENCY now issues `continue` to
+  restart the loop instead of falling through to NIGHT mode. Observed twice in logs
+  (Mar 03 15:53, Mar 04 07:56) — NIGHT-stop fired and halted charging while battery
+  was 47-50%.
+- BUG FIX: state.current_amps not reset on EMERGENCY exit caused SOLAR to immediately
+  drop amps (48A -> 28A -> 6A) on the first post-EMERGENCY loop. Now resets to 0 on
+  all EMERGENCY exit paths (matching CALENDAR exit pattern).
+- BUG FIX: state.cached_battery not reset on new session connect — first loop could
+  run SOLAR with the pre-session battery level, missing EMERGENCY detection for one
+  full 30s loop (observed Mar 05 07:48).
+- BUG FIX: night_stop_sent not cleared on EMERGENCY entry — if NIGHT fired before
+  EMERGENCY resolved, night mode persisted after recovery and suppressed charging
+  until sunrise.
+- FEATURE: EMERGENCY wake escalation — after BLE_FAILS_BEFORE_WAKE consecutive BLE
+  failures, escalates to API wake (matching MANUAL/CALENDAR behavior).
 
 v4.0.17-twc - Fix EMERGENCY fallthrough to SOLAR after 90min reset
 - BUG FIX: When EMERGENCY mode hit the 90-min timeout with battery still rising,
@@ -111,7 +129,7 @@ Solar Charger - BLE Edition v3.6.6 / v3.6.5 / v3.6.4
 ================================================================================
 """
 
-VERSION = "v4.0.16-twc"
+VERSION = "v4.0.18-twc"
 
 import time
 import subprocess
@@ -129,7 +147,7 @@ from typing import Optional, Deque, Dict, Any
 VIN = os.getenv("TESLA_VIN", "")
 KEY_FILE = "/app/private.pem"
 CACHE_FILE = "/app/cache.json"
-TESLA_EMAIL = "YOUR_TESLA_EMAIL@example.com"
+TESLA_EMAIL = os.getenv("TESLA_EMAIL", "")
 
 # -------------------------------
 # NETWORK CONFIG (Stage 1 migration prep)
@@ -152,7 +170,7 @@ BLE_RELAY_ENABLED = os.getenv("BLE_RELAY_ENABLED", "true").lower() == "true"
 BLE_RELAY_HOST = os.getenv("BLE_RELAY_HOST", "SolarPiZero")
 BLE_RELAY_PORT = int(os.getenv("BLE_RELAY_PORT", "5003"))
 BLE_RELAY_URL = f"http://{BLE_RELAY_HOST}:{BLE_RELAY_PORT}"
-BLE_RELAY_API_KEY = os.getenv("BLE_RELAY_API_KEY", "YOUR_BLE_RELAY_API_KEY")
+BLE_RELAY_API_KEY = os.getenv("BLE_RELAY_API_KEY", "")
 
 TWC_CACHE_TTL = 15
 TWC_STALE_THRESHOLD = 90
@@ -854,6 +872,7 @@ def main():
             # Invalidate stale Tesla status — new session needs fresh data
             state.cached_ts = 0.0
             state.cached_charging_state = None
+            state.cached_battery = None  # Reset so EMERGENCY check uses fresh battery, not pre-session value
             log("  └─ Invalidated Tesla cache (forces fresh API query)")
 
             # One-time retry of disconnect normalization if needed
@@ -1055,6 +1074,7 @@ def main():
             if state.emergency_start_ts is None:
                 state.emergency_start_ts = time.time()
                 state.emergency_start_battery = battery
+                state.night_stop_sent = False  # Clear night flag so NIGHT doesn't suppress charging
                 log(f"EMERGENCY: entered at {battery}% (tracking start time)")
 
             elapsed = time.time() - state.emergency_start_ts
@@ -1076,6 +1096,8 @@ def main():
                     log(f"EMERGENCY: battery recovered to {battery}% (>= {BATTERY_EMERGENCY}%) -> exiting emergency")
                     state.emergency_start_ts = None
                     state.emergency_start_battery = None
+                    state.current_amps = 0  # Force SOLAR to recalculate from scratch (not from 48A baseline)
+                    continue  # Restart loop — don't fall through to NIGHT/CALENDAR
 
             if state.emergency_start_ts is not None:
                 if elapsed >= MAX_EMERGENCY_RUNTIME:
@@ -1088,6 +1110,7 @@ def main():
                         log("EMERGENCY: 90min elapsed and battery not rising -> exiting (conservative)")
                         state.emergency_start_ts = None
                         state.emergency_start_battery = None
+                        state.current_amps = 0  # Force SOLAR to recalculate from scratch (not from 48A baseline)
                 else:
                     if state.current_amps != MAX_AMPS:
                         if ble_allowed():
@@ -1125,6 +1148,14 @@ def main():
                             set_charging_amps(MAX_AMPS)
                         elif not ble_allowed():
                             log("EMERGENCY: TWC amps low but BLE gated; will retry next loop")
+
+                    # Wake escalation: escalate to API wake after repeated BLE failures
+                    if twc_state is True and state.ble_fail_count >= BLE_FAILS_BEFORE_WAKE:
+                        log(f"EMERGENCY: BLE failed {state.ble_fail_count}x while connected — escalating to API wake")
+                        wake_vehicle_safe('emergency')
+                        log("EMERGENCY wake escalation attempted; resetting BLE failure counters")
+                        state.ble_fail_count = 0
+                        state.ble_backoff_until = 0
 
                     solar = get_solar_data()
                     if solar:
