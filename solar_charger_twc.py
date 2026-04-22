@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 ================================================================================
+Solar Charger TWC Fork - v4.0.20-twc - Reset current_amps on session start (stale-48A fix)
+Solar Charger TWC Fork - v4.0.19-twc - Suppress BLE when car complete at target in SOLAR
 Solar Charger TWC Fork - v4.0.18-twc - Fix EMERGENCY exit/night/wake/session bugs
 Solar Charger TWC Fork - v4.0.17-twc - Fix EMERGENCY fallthrough to SOLAR after 90min reset
 Solar Charger TWC Fork - v4.0.16-twc - Smart calendar timing + 80% approval gate
@@ -23,6 +25,28 @@ Based on: Solar Charger v4.0.10
 ================================================================================
 HISTORICAL CHANGELOG (PRESERVED VERBATIM)
 ================================================================================
+
+v4.0.20-twc - Reset current_amps on session start (stale-48A fix)
+- BUG FIX: Disconnect normalization set current_amps=48, which survived into the next
+  session. If SOLAR calculated target=48 (strong sun), it saw "stable" and never sent
+  a BLE command — leaving the car at its own default (e.g. 16A) for the entire session
+  until solar fluctuation broke the deadlock.
+- FIX: Reset current_amps=0 on SESSION STARTED (TWC connect edge), matching the pattern
+  already used by EMERGENCY exit (line 1130) and CALENDAR exit (line 1380). SOLAR now
+  always re-establishes explicit control from 6A upward on each new charge session.
+- TRADE-OFF: ~5.5 min ramp-up from 6A→48A on plug-in during strong solar (11 loops at
+  MAX_AMP_STEP=4). Excess solar is exported during ramp — not wasted, just not used for
+  charging until SOLAR catches up.
+
+v4.0.19-twc - Suppress BLE when car complete at target in SOLAR mode
+- BUG FIX: SOLAR mode was sending amp-adjustment BLE commands and high-solar wake
+  after car reached 80% ("Complete"), keeping the car awake unnecessarily.
+- Added guard before high-solar wake: skip wake if Complete at/above target.
+- Added guard inside stability block: skip set_charging_amps/set_charge_limit/
+  start_charging if Complete at/above target. Resets current_amps to 0 (no BLE —
+  purely in-memory) so next session starts with a clean baseline.
+- Lines 1551-1560 (restart-charging if Complete below target) and disconnect
+  normalization (48A reset on unplug) are unaffected.
 
 v4.0.18-twc - Fix EMERGENCY exit/night/wake/session bugs (5 bugs fixed)
 - BUG FIX (Critical): Battery recovery exit from EMERGENCY now issues `continue` to
@@ -129,7 +153,7 @@ Solar Charger - BLE Edition v3.6.6 / v3.6.5 / v3.6.4
 ================================================================================
 """
 
-VERSION = "v4.0.18-twc"
+VERSION = "v4.0.20-twc"
 
 import time
 import subprocess
@@ -198,6 +222,7 @@ SUSTAINED_NIGHT_SEC = 600
 BLE_COOLDOWN = 12
 BLE_BACKOFF_INITIAL = 60
 BLE_MAX_BACKOFF = 3600
+RELAY_UNREACHABLE_ALERT_THRESHOLD = 3
 
 # Wake escalation (MANUAL mode only)
 WAKE_COOLDOWN_SEC = 900       # 15 minutes
@@ -274,6 +299,8 @@ class ChargerState:
 
     # --- v4.0.3: Dashboard warning flags ---
     grid_charge_warning_amps: Optional[float] = None
+    relay_unreachable_streak: int = 0
+    relay_unreachable_alert: bool = False
 
 state = ChargerState()
 
@@ -445,6 +472,8 @@ def update_dashboard_status(mode, amps, target_amps, battery, excess_watts, prod
             'ble_backoff_until': state.ble_backoff_until,
             'ble_backoff_remaining': max(0, int(state.ble_backoff_until - time.time())),
             'grid_charge_warning_amps': state.grid_charge_warning_amps,
+            'relay_unreachable_streak': state.relay_unreachable_streak,
+            'relay_unreachable_alert': state.relay_unreachable_alert,
             'is_preconditioning': state.cached_is_preconditioning,
             'calendar_reason': state.calendar_reason
         }
@@ -704,6 +733,8 @@ def ble_call(cmd, val=None, domain='infotainment'):
     if ok or "already" in out or "is_charging" in out or "not_charging" in out:
         log("BLE >>> OK")
         state.ble_fail_count = 0
+        state.relay_unreachable_streak = 0
+        state.relay_unreachable_alert = False
         return True
 
     # Handle failures
@@ -721,6 +752,19 @@ def ble_call(cmd, val=None, domain='infotainment'):
         log(f"BLE >>> FAILED: {out[:120]}")
         log_ble_failure_context()
         state.ble_backoff_until = time.time() + calculate_ble_backoff()
+
+    if "relay connection failed - pi zero unreachable" in out:
+        state.relay_unreachable_streak += 1
+        if state.relay_unreachable_streak >= RELAY_UNREACHABLE_ALERT_THRESHOLD:
+            if not state.relay_unreachable_alert:
+                log(
+                    f"⚠️ ALERT: BLE relay unreachable for "
+                    f"{state.relay_unreachable_streak} consecutive attempts"
+                )
+            state.relay_unreachable_alert = True
+    else:
+        state.relay_unreachable_streak = 0
+        state.relay_unreachable_alert = False
 
     return False
 
@@ -866,8 +910,9 @@ def main():
         if state.last_twc_state is False and twc_state is True:
             state.session_start_ts = time.time()
             state.session_peak_amps = 0
+            state.current_amps = 0  # Force SOLAR to recalculate from scratch (not from stale disconnect value)
             log("📊 SESSION STARTED: tracking begins")
-            log(f"🔋 New session: resetting BLE + emergency state")
+            log(f"🔋 New session: resetting BLE + emergency state + current_amps")
 
             # Invalidate stale Tesla status — new session needs fresh data
             state.cached_ts = 0.0
@@ -1477,7 +1522,14 @@ def main():
         # Wake once (cooldown protected) to allow BLE charging.
         # [NEW] High Solar Wake-Up
         # SOLAR WAKE — must run before any BLE
+        # Skip wake if car is already complete at/above target — nothing to charge
+        car_complete_at_target = (
+            charging_state == 'Complete'
+            and battery is not None
+            and battery >= DEFAULT_BATTERY_TARGET
+        )
         if (
+            not car_complete_at_target and
             excess_smooth > 500 and
             charging_state != 'Charging' and
             twc_state is True and
@@ -1502,7 +1554,16 @@ def main():
 
         if (len(state.amp_target_history) >= AMP_STABILITY_COUNT
                 and all(a == banded_target for a in state.amp_target_history)):
-            if abs(banded_target - state.current_amps) >= AMP_CHANGE_THRESHOLD:
+            if car_complete_at_target:
+                # Car has reached its charge target — no BLE needed.
+                # Reset current_amps so next session starts from a clean baseline.
+                if state.current_amps != 0:
+                    log(f"SOLAR: Car complete at {battery}% — suppressing BLE, resetting current_amps "
+                        f"{state.current_amps}A -> 0")
+                    state.current_amps = 0
+                else:
+                    log(f"SOLAR: Car complete at {battery}% — suppressing BLE")
+            elif abs(banded_target - state.current_amps) >= AMP_CHANGE_THRESHOLD:
                 if excess_smooth <= 0 and state.current_amps == 0:
                     twc_amps = get_twc_current_amps()
                     # Only warn if TWC shows significantly more than MIN_AMPS

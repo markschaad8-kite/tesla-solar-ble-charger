@@ -1,4 +1,4 @@
-# Tesla Solar Charger (BLE + TWC Edition) - v4.0.16-twc
+# Tesla Solar Charger (BLE + TWC Edition) - v4.0.20-twc
 
 Automated Tesla charging control running on Raspberry Pi. Adjusts charging amperage in real-time based on solar excess using local Bluetooth (BLE) control via a Pi Zero relay. No cloud dependency for day-to-day operation.
 
@@ -14,7 +14,9 @@ Automated Tesla charging control running on Raspberry Pi. Adjusts charging amper
 * **Smart Disconnect:** Automatically resets the car to 48A when unplugged, so plugging back in resumes at max rate. Handles BLE cooldown edge cases with pending normalization.
 * **Zero-Grid Drain:** Night mode automatically stops charging when solar production drops below 100W for 10 minutes.
 * **Solar Takeover (v4.0.8):** Dashboard button to force solar control when external charging is detected.
-* **Wake Escalation:** After 3 BLE failures, escalates to Tesla API wake. Separate cooldown tracking for MANUAL, SOLAR, and CALENDAR modes. Fast-wake path for MANUAL mode (~30s vs ~3min).
+* **Wake Escalation:** After 3 BLE failures, escalates to Tesla API wake. Separate cooldown tracking for MANUAL, SOLAR, CALENDAR, and EMERGENCY modes. Fast-wake path for MANUAL mode (~30s vs ~3min).
+* **Relay Health Monitoring (v4.0.20):** Tracks consecutive BLE relay unreachable events and logs an alert after 3 consecutive failures.
+* **Clean Session Start (v4.0.20):** Resets amp tracking on each new plug-in session so SOLAR mode always re-establishes explicit control from the minimum upward, rather than inheriting a stale amp value from a prior disconnect.
 
 ## Charging Modes
 
@@ -163,6 +165,10 @@ See `pi-zero-ble-relay/` for relay setup and documentation.
 
 | Version | Highlights |
 |---------|-----------|
+| **v4.0.20-twc** | Reset current_amps on session start (stale-48A deadlock fix); relay unreachable streak alerting |
+| **v4.0.19-twc** | Suppress BLE commands and high-solar wake when car is Complete at target in SOLAR mode |
+| **v4.0.18-twc** | Fix 5 EMERGENCY bugs: fallthrough to NIGHT, stale current_amps, cached_battery not cleared on connect, night_stop_sent not cleared on EMERGENCY entry, missing wake escalation |
+| **v4.0.17-twc** | Fix EMERGENCY fallthrough to SOLAR after 90-min timeout reset (missing `continue`) |
 | **v4.0.16-twc** | Calendar-aware charging, smart charge timing, 80% approval gate, calendar wake escalation |
 | **v4.0.15-twc** | BLE relay API key auth, SOLAR_API_BASE fix, emergency battery-unknown safety |
 | **v4.0.14-twc** | TWC stale data polling optimization |
