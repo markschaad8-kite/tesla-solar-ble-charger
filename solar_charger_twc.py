@@ -758,7 +758,7 @@ def ble_call(cmd, val=None, domain='infotainment'):
         if state.relay_unreachable_streak >= RELAY_UNREACHABLE_ALERT_THRESHOLD:
             if not state.relay_unreachable_alert:
                 log(
-                    f"⚠️ ALERT: BLE relay unreachable for "
+                    f"ALERT: BLE relay unreachable for "
                     f"{state.relay_unreachable_streak} consecutive attempts"
                 )
             state.relay_unreachable_alert = True

@@ -1,22 +1,19 @@
-# Tesla Solar Charger (BLE + TWC Edition) - v4.0.20-twc
+# Tesla Solar Charger (BLE + TWC Edition)
 
-Automated Tesla charging control running on Raspberry Pi. Adjusts charging amperage in real-time based on solar excess using local Bluetooth (BLE) control via a Pi Zero relay. No cloud dependency for day-to-day operation.
+Controls Tesla charging based on solar excess. Runs on a Raspberry Pi 5 in a Podman container; BLE commands go through a Pi Zero 2 W relay positioned near the vehicle. No cloud dependency for day-to-day operation.
 
-## Core Features
+## What it does
 
-* **Solar Tracking:** Monitors Enphase Envoy data to adjust vehicle charging amps (1A increments) to match solar export. 3-sample moving average smoothing prevents cloud-cover flapping.
-* **BLE-First Control:** Uses `tesla-control` (Bluetooth Low Energy) for all commands via a Pi Zero 2 W relay. Faster than the HTTP API, avoids waking the car unnecessarily, and the relay can be positioned near the vehicle independently.
-* **TWC Home Detection:** Polls the Tesla Wall Connector locally to detect plug state. TWC connection is the sole authority for "at home" status (no GPS geofencing).
-* **Calendar-Aware Charging (v4.0.16):** Reads Google Calendar for upcoming trips with locations. An AI assessment determines round-trip distance and recommends a battery target (50-95%). Short trips get lower targets; long trips get higher ones. Smart timing calculates when to start charging based on departure time minus estimated charge duration.
-* **80% Approval Gate (v4.0.16):** When calendar targets exceed 80%, charging pauses at 80% and waits for user approval via the dashboard (battery health protection). Targets at or below 80% charge straight through without pausing. Auto-approves if less than 2 hours before the event.
-* **Preconditioning Detection (v4.0.11):** Detects when the vehicle is preconditioning (climate prep) and skips amp adjustments to avoid interfering with the vehicle's thermal management.
-* **Emergency Mode:** If battery drops below 50%, overrides all other modes and charges at full speed (48A) until 50%. Monitors progress and continues past 90-minute fallback if battery is still rising.
-* **Smart Disconnect:** Automatically resets the car to 48A when unplugged, so plugging back in resumes at max rate. Handles BLE cooldown edge cases with pending normalization.
-* **Zero-Grid Drain:** Night mode automatically stops charging when solar production drops below 100W for 10 minutes.
-* **Solar Takeover (v4.0.8):** Dashboard button to force solar control when external charging is detected.
-* **Wake Escalation:** After 3 BLE failures, escalates to Tesla API wake. Separate cooldown tracking for MANUAL, SOLAR, CALENDAR, and EMERGENCY modes. Fast-wake path for MANUAL mode (~30s vs ~3min).
-* **Relay Health Monitoring (v4.0.20):** Tracks consecutive BLE relay unreachable events and logs an alert after 3 consecutive failures.
-* **Clean Session Start (v4.0.20):** Resets amp tracking on each new plug-in session so SOLAR mode always re-establishes explicit control from the minimum upward, rather than inheriting a stale amp value from a prior disconnect.
+- Tracks Enphase solar data and adjusts charging amps (6–48A) to consume available excess. 3-sample moving average prevents cloud-flapping.
+- Uses `tesla-control` over BLE through a Pi Zero relay — lower latency than the Tesla API, avoids waking the car unnecessarily, and the relay can be positioned independently for better range.
+- Detects home/away via Tesla Wall Connector plug state. No GPS geofencing.
+- Reads Google Calendar for upcoming trips. An AI assessment estimates round-trip distance and recommends a battery target (50–95%); timing is calculated from departure minus estimated charge time so it doesn't start charging 24 hours early.
+- Trips targeting above 80% pause at 80% for dashboard approval. Auto-approves if departure is under 2 hours out.
+- When battery drops below 50%, charges at full speed (48A) regardless of solar. Continues past the 90-minute fallback if battery is still rising.
+- Stops charging when solar drops below 100W for 10 minutes. Resumes at sunrise.
+- After 3 consecutive BLE failures, escalates to a Tesla API wake. Each mode tracks its own cooldown separately.
+- Resets the car to 48A on unplug so the next session starts at max rate.
+- Resets amp tracking on each new plug-in so SOLAR always ramps from the minimum rather than inheriting a stale value.
 
 ## Charging Modes
 
@@ -46,7 +43,6 @@ Pi 5 (main controller)              Pi Zero 2 W (BLE relay)
 └─────────────────────────┘         └──────────────────────┘
 ```
 
-**Key design decisions:**
 - Two-Pi design: control logic on Pi 5, BLE proximity on Pi Zero
 - All solar/TWC data flows through localhost dashboard APIs (single Envoy consumer)
 - BLE relay authenticates via X-API-Key header
@@ -54,25 +50,25 @@ Pi 5 (main controller)              Pi Zero 2 W (BLE relay)
 
 ## Requirements
 
-* **Raspberry Pi 5** (or 3/4) as main controller
-* **Pi Zero 2 W** as BLE relay (positioned near vehicle)
-* **Tesla Wall Connector** (Gen 2/3, on local network)
-* **Enphase Envoy** (or compatible solar gateway with local API)
-* **Dashboard service** providing the API endpoints below
-* `tesla-control` binary (Tesla vehicle-command Go SDK)
-* Tesla auth token (`cache.json`) and BLE private key (`private.pem`)
+- Raspberry Pi 5 (or 3B/4) as main controller
+- Pi Zero 2 W as BLE relay, placed near the vehicle
+- Tesla Wall Connector (Gen 2/3) on the local network
+- Enphase Envoy (or compatible solar gateway with a local API)
+- A dashboard service providing the endpoints below
+- `tesla-control` binary from the Tesla vehicle-command SDK
+- Tesla auth token (`cache.json`) and BLE private key (`private.pem`)
 
 ## Setup
 
-1. Update the `CONFIG` section in `solar_charger_twc.py` with your VIN and email.
-2. Place `private.pem` and `cache.json` in the application directory.
-3. Configure the BLE relay on Pi Zero (see `pi-zero-ble-relay/`).
-4. Set `BLE_RELAY_API_KEY` environment variable (or update the default in code).
-5. Deploy via Podman/Docker + systemd.
+1. Set `TESLA_VIN` and `TESLA_EMAIL` environment variables (or edit the constants in `solar_charger_twc.py`).
+2. Place `private.pem` and `cache.json` in the working directory.
+3. Configure the BLE relay on the Pi Zero (see `pi-zero-ble-relay/`).
+4. Set `BLE_RELAY_API_KEY` to match the relay's configured key.
+5. Build the container and deploy via systemd.
 
 ## Dashboard API Contract
 
-The charger expects a dashboard to provide these HTTP endpoints. Implement using Flask, Home Assistant, Node-RED, or any web framework.
+The charger expects a dashboard to expose these HTTP endpoints.
 
 ### Required Endpoints
 
@@ -85,7 +81,7 @@ The charger expects a dashboard to provide these HTTP endpoints. Implement using
 
 ### Endpoint Details
 
-**GET `/api/envoy_data`** - Solar production data
+**GET `/api/envoy_data`**
 ```json
 {
   "production_watts": 5200,
@@ -93,7 +89,7 @@ The charger expects a dashboard to provide these HTTP endpoints. Implement using
 }
 ```
 
-**GET `/api/charging/config`** - Mode, flags, and calendar advisory
+**GET `/api/charging/config`**
 ```json
 {
   "mode": "SOLAR",
@@ -113,7 +109,7 @@ The charger expects a dashboard to provide these HTTP endpoints. Implement using
 }
 ```
 
-**POST `/api/set_charger_status`** - Telemetry from charger
+**POST `/api/set_charger_status`** — telemetry from charger
 ```json
 {
   "mode": "SOLAR",
@@ -132,7 +128,7 @@ The charger expects a dashboard to provide these HTTP endpoints. Implement using
 }
 ```
 
-**GET `/api/twc/vehicle_connected`** - TWC connection state
+**GET `/api/twc/vehicle_connected`**
 ```json
 {
   "connected": true,
@@ -151,7 +147,7 @@ The charger expects a dashboard to provide these HTTP endpoints. Implement using
 
 ### BLE Relay
 
-The charger sends commands to the Pi Zero relay via HTTP:
+Commands go to the Pi Zero relay via HTTP POST:
 
 **POST `http://<relay-host>:5003/ble/command`**
 ```json
@@ -159,27 +155,23 @@ The charger sends commands to the Pi Zero relay via HTTP:
 ```
 Headers: `X-API-Key: <your-api-key>`
 
-See `pi-zero-ble-relay/` for relay setup and documentation.
+See `pi-zero-ble-relay/` for relay setup.
 
 ## Version History
 
 | Version | Highlights |
 |---------|-----------|
 | **v4.0.20-twc** | Reset current_amps on session start (stale-48A deadlock fix); relay unreachable streak alerting |
-| **v4.0.19-twc** | Suppress BLE commands and high-solar wake when car is Complete at target in SOLAR mode |
-| **v4.0.18-twc** | Fix 5 EMERGENCY bugs: fallthrough to NIGHT, stale current_amps, cached_battery not cleared on connect, night_stop_sent not cleared on EMERGENCY entry, missing wake escalation |
+| **v4.0.19-twc** | Suppress BLE and high-solar wake when car is Complete at target in SOLAR |
+| **v4.0.18-twc** | Fix 5 EMERGENCY bugs: fallthrough to NIGHT, stale amps on exit, cached_battery stale on connect, night_stop persisting into EMERGENCY, missing wake escalation |
 | **v4.0.17-twc** | Fix EMERGENCY fallthrough to SOLAR after 90-min timeout reset (missing `continue`) |
-| **v4.0.16-twc** | Calendar-aware charging, smart charge timing, 80% approval gate, calendar wake escalation |
+| **v4.0.16-twc** | Calendar-aware charging, smart charge timing, 80% approval gate |
 | **v4.0.15-twc** | BLE relay API key auth, SOLAR_API_BASE fix, emergency battery-unknown safety |
 | **v4.0.14-twc** | TWC stale data polling optimization |
 | **v4.0.13-twc** | Wake cache consistency fix, auth cache structure fix |
 | **v4.0.12-twc** | Relay payload fix, state reset helpers refactor |
-| **v4.0.11-twc** | Preconditioning detection (skip amp adjustments during precond) |
+| **v4.0.11-twc** | Preconditioning detection |
 | **v4.0.10-twc** | TWC-only home detection (GPS geofencing removed) |
 | **v3.6.9** | Emergency mode TWC verification and reassert |
 | **v3.6.8** | AWAY night tracking, BLE alert dashboard |
 | **v3.6.7** | Emergency exit fix, battery age indicator, session summaries |
-
-## Disclaimer
-
-Use at your own risk. This script interfaces directly with vehicle charging hardware and high-voltage systems.
