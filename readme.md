@@ -4,7 +4,7 @@ Controls Tesla charging based on solar excess. Runs on a Raspberry Pi 5 in a Pod
 
 ## What it does
 
-- Tracks Enphase solar data and adjusts charging amps (6–48A) to consume available excess. 3-sample moving average prevents cloud-flapping.
+- Tracks Enphase solar data and adjusts charging amps (6–48A) to consume available excess. Uses a 60s 1Hz median for SOLAR steady-state targeting (v4.0.27) plus short-window smooth for cliff detection; 3-sample smoothing remains for dashboard/logs.
 - Uses `tesla-control` over BLE through a Pi Zero relay — lower latency than the Tesla API, avoids waking the car unnecessarily, and the relay can be positioned independently for better range.
 - Detects home/away via Tesla Wall Connector plug state. No GPS geofencing.
 - Reads Google Calendar for upcoming trips. An AI assessment estimates round-trip distance and recommends a battery target (50–95%); timing is calculated from departure minus estimated charge time so it doesn't start charging 24 hours early.
@@ -60,11 +60,20 @@ Pi 5 (main controller)              Pi Zero 2 W (BLE relay)
 
 ## Setup
 
-1. Set `TESLA_VIN` and `TESLA_EMAIL` environment variables (or edit the constants in `solar_charger_twc.py`).
-2. Place `private.pem` and `cache.json` in the working directory.
+1. Copy `deploy/config.env.example` to `pi-zero-ble-relay/config.env` and set `TESLA_VIN`, `TESLA_EMAIL`, `BLE_RELAY_HOST` (static IP of the Pi Zero), and `API_KEY` (must match relay).
+2. Place `private.pem` and `cache.json` in the repo root (or paths you mount into the container).
 3. Configure the BLE relay on the Pi Zero (see `pi-zero-ble-relay/`).
-4. Set `BLE_RELAY_API_KEY` to match the relay's configured key.
-5. Build the container and deploy via systemd.
+4. Edit `deploy/solar-charger.service` so all paths match your install (default template uses `/opt/tesla-solar-control`), then build and start:
+
+```bash
+sudo podman build -t localhost/tesla-solar-control:latest .
+sudo install -m 644 deploy/solar-charger.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now solar-charger
+```
+
+Or run `deploy/install.sh` once your `config.env` is filled in (see script header).
+
+`preflight.sh` runs before the container start in the sample unit; it expects a numeric `BLE_RELAY_HOST` in the effective systemd config.
 
 ## Dashboard API Contract
 
@@ -161,6 +170,13 @@ See `pi-zero-ble-relay/` for relay setup.
 
 | Version | Highlights |
 |---------|-----------|
+| **v4.0.27-twc** | SOLAR tightening: 1Hz median for steady-state targets, fast-drop on import spike + smooth excess cliff, TWC tracking gate on upward steps, SSE stale hold/recovery, voltage-based amp divisor when telemetry present |
+| **v4.0.26-twc** | Per-loop grid voltage from Envoy SSE → dashboard → telemetry (`volt=` on Charge line) |
+| **v4.0.25-twc** | Telemetry: TWC actual amps, BLE amp command age, `last_ble_amp_command_t` |
+| **v4.0.24-twc** | Truthful `current_amps` seed on session start; replug throttle fix |
+| **v4.0.23-twc** | Charge-limit reset fixes (`force=True` paired BLE, calendar exit, startup reconcile) |
+| **v4.0.22-twc** | 1 Hz signal ring buffer from dashboard (Option B plumbing) |
+| **v4.0.21-twc** | Stale Envoy / solar data failsafe (48A in SOLAR during extended outage) |
 | **v4.0.20-twc** | Reset current_amps on session start (stale-48A deadlock fix); relay unreachable streak alerting |
 | **v4.0.19-twc** | Suppress BLE and high-solar wake when car is Complete at target in SOLAR |
 | **v4.0.18-twc** | Fix 5 EMERGENCY bugs: fallthrough to NIGHT, stale amps on exit, cached_battery stale on connect, night_stop persisting into EMERGENCY, missing wake escalation |

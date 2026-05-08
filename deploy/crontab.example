@@ -1,0 +1,4 @@
+# Optional: daily charging stats log (see solar_charge_daily_stats.py).
+# Merge into your user's crontab.
+#
+# 7 6 * * * /usr/bin/python3 /opt/tesla-solar-control/solar_charge_daily_stats.py >> ~/solar_charge_stats_cron.log 2>&1

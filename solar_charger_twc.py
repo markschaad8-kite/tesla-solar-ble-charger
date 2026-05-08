@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
 ================================================================================
+Solar Charger TWC Fork - v4.0.26-twc - Telemetry-only: per-loop voltage_v from envoy SSE (no decision changes)
+Solar Charger TWC Fork - v4.0.25-twc - Telemetry-only: per-loop TWC actual amps + ble_amp_age (no decision changes)
+Solar Charger TWC Fork - v4.0.24-twc - Truthful current_amps seed on session start (no-sun replug throttle-down)
+Solar Charger TWC Fork - v4.0.23-twc - Charge-limit reset bugfixes (force= + calendar-exit + startup reconcile)
+Solar Charger TWC Fork - v4.0.22-twc - 1Hz signal ring buffer (Option B plumbing)
+Solar Charger TWC Fork - v4.0.21-twc - Stale Envoy data failsafe (charge at 48A during outage)
 Solar Charger TWC Fork - v4.0.20-twc - Reset current_amps on session start (stale-48A fix)
 Solar Charger TWC Fork - v4.0.19-twc - Suppress BLE when car complete at target in SOLAR
 Solar Charger TWC Fork - v4.0.18-twc - Fix EMERGENCY exit/night/wake/session bugs
@@ -25,6 +31,190 @@ Based on: Solar Charger v4.0.10
 ================================================================================
 HISTORICAL CHANGELOG (PRESERVED VERBATIM)
 ================================================================================
+
+v4.0.27-twc - SOLAR-mode tightening: median-based decisions + 4 new gates
+- FEATURE: SOLAR steady-state amp targeting now uses excess_median (60s 1Hz
+  window from the v4.0.22 ring buffer) instead of excess_smooth (3-sample
+  30s mean). Median is more truthful than smooth on broken-cloud chop —
+  smooth lags the live signal by 30-60s on transient swings. excess_smooth
+  is retained for fast-drop and for logs/dashboard.
+- FEATURE: Fast-drop bypass. When max_import_5s >= 3000W AND excess_smooth
+  < 0 (cliff confirmed in both 5s peak and 30s mean), drop to MIN_AMPS
+  immediately, bypassing AMP_STABILITY_COUNT. Smooth (not median) is the
+  cliff trigger because median trails by ~30-60s on a transient. Validated
+  against May 7 2026 events at 08:58, 14:15, 18:12.
+- FEATURE: TWC tracking gate on UPWARD steps only. If twc_actual_a is
+  >TWC_TRACKING_TOLERANCE_A behind state.current_amps, hold instead of
+  ramping further. Targets the May 4 14:09 + May 7 10:43 stuck-car class
+  where cached_charging_state lies but TWC tells the truth (replay shows
+  -10 BLE in the May 7 10:42-10:50 window alone).
+- FEATURE: SSE staleness freeze + post-stale recovery counter. When
+  envoy_age_max > SSE_STALE_THRESHOLD_S (30s), hold both directions. Need
+  SSE_FRESH_RECOVERY_LOOPS (2) consecutive loops with age <
+  SSE_FRESH_THRESHOLD_S (15s) before resuming UP-step ramp authority.
+  Targets May 4 14:14:59 phantom +11kW single-sample greedy ramp.
+- FEATURE: Voltage correction in calculate_target_amps. When voltage_v is
+  in the 100-130V/phase sane range, divide by 2*voltage_v (real split-phase
+  ~246V) instead of the assumed 240V. May 2026 telemetry shows ~2.5%
+  upward bias from this — small but free.
+- NEW STATE FIELD: ChargerState.fresh_recovery_count (int). Bumped each
+  fresh loop, reset on staleness. Ramp authority is post_stale = (count <
+  SSE_FRESH_RECOVERY_LOOPS).
+- NEW CONSTANTS: FAST_DROP_IMPORT_W (3000W), SSE_STALE_THRESHOLD_S (30s),
+  SSE_FRESH_THRESHOLD_S (15s), SSE_FRESH_RECOVERY_LOOPS (2),
+  TWC_TRACKING_TOLERANCE_A (4A).
+- API CHANGE: calculate_target_amps signature is (excess, baseline_amps,
+  voltage_v=None) — old (excess, current_amps) calls still compatible
+  because voltage_v defaults to None (=> divisor=240V, prior behavior).
+- INVARIANTS PRESERVED: MAX_AMP_STEP=4, AMP_STABILITY_BAND=2, BLE_COOLDOWN
+  unchanged. EMERGENCY/CALENDAR/MANUAL paths still read excess_smooth.
+  Wife-Tesla-app guard at the stability block (current_amps==0 sentinel
+  + non-positive excess) is preserved per project_tesla_app_workflow.md
+  and the v4.0.24 overloaded-sentinel lesson — only the comparison signal
+  flipped from excess_smooth to decision_excess so the guard lines up
+  with the new basis.
+- VALIDATION: replay_v4_0_27.py per-row harness. Against May 7 2026
+  full-day Charging-state telemetry: 62 actual BLE -> 68 sim BLE
+  (+6, ~10%). The +6 is small +2A increments where the more responsive
+  median catches movement that excess_smooth's hysteresis filtered. The
+  trade is the chase event: 13 BLE -> 3 BLE in the 10:42-10:50 stuck-car
+  window. Three cliff events all caught at the right loop.
+- KNOWN TRADE-OFF: Fast-drop on smooth<0 + mi5>=3000 over-corrects on
+  moderate dips (May 7 14:15: actual 46->40, sim 46->6). Watching for
+  this in May 9-15 daily-stats; tighten threshold in v4.0.28 if it shows
+  up repeatedly.
+- ROLLBACK: git revert <commit> && sudo podman build -t
+  localhost/tesla-solar-control:latest . && sudo systemctl restart
+  solar-charger.
+
+v4.0.26-twc - Telemetry-only: per-loop voltage_v from envoy SSE
+- FEATURE: Per-phase voltage now flows envoy_logger SSE -> dashboard
+  /api/envoy_data -> SignalSample.voltage_v -> Charge: log line. The new
+  `volt={voltage:.1f}V` field on the Charge: line captures grid voltage
+  every loop. phase2_telemetry.py PAT_CHARGE extended (voltage_v column).
+- RATIONALE: Real-time grid voltage is needed for the v4.0.27 SOLAR-mode
+  amp-target tuning work (see SOLAR_TIGHTENING_PLAN.md). Plumbing it as
+  pure telemetry first lets us collect a few days of data before any
+  algorithmic change reads it.
+- INVARIANTS PRESERVED: Zero changes to decision logic.
+  calculate_target_amps still uses excess_smooth only; voltage_v is
+  read into SignalSample but never consumed. envoy_logger falls back to
+  None on parse failure (does not crash SSE loop). Dashboard returns
+  voltage_v=null if envoy_logger has no value yet; SignalSample defaults
+  to 0.0 in that case.
+
+v4.0.25-twc - Telemetry-only: per-loop TWC actual amps + ble_amp_age
+- FEATURE: New `Charge:` log line in the main per-loop block, immediately after
+  the existing `Signal:` line. Captures `twc_actual_a`, `cmd_a`,
+  `ble_amp_age_s`, and `charging_state` every loop. Pure observability —
+  intended to feed the v4.0.25+ SOLAR-mode tightening work documented in
+  SOLAR_TIGHTENING_PLAN.md (post-BLE settle window analysis specifically).
+- FEATURE: New `state.last_ble_amp_command_t` field tracking only successful
+  `charging-set-amps` BLE commands. Distinct from the existing
+  `state.last_ble_time` (which counts ALL BLE: amps/start/stop/limit). The new
+  field lets the post-event analysis bin loops as "fresh BLE / settling /
+  settled" cleanly without conflating limit-set or start/stop BLE.
+- INVARIANTS PRESERVED: Zero changes to any decision logic — `excess_smooth`
+  still drives `calculate_target_amps`, AMP_STABILITY_COUNT still gates BLE,
+  all mode-specific paths unchanged. The TWC poll on each loop is a localhost
+  call (~5ms) and uses the existing `get_twc_current_amps()` helper which
+  already has its own try/except. If TWC is unreachable the log line shows
+  `twc=?` and the rest of the loop is unaffected.
+- DEFERRED: Voltage capture from SSE was on the original wishlist but neither
+  dashboard's `/api/envoy_data` nor envoy_logger's `/live` endpoint exposes
+  voltage today. Plumbing it requires a cross-project change to envoy_logger.
+  Not done in this point release; revisit if Phase-1-style per-phase voltage
+  becomes necessary for tuning.
+
+v4.0.24-twc - Truthful current_amps seed on session start (no-sun replug throttle-down)
+- BUG: On a same-spot replug with no solar excess, the script let the car
+  drink 48A from the grid until it hit the (newly v4.0.23-enforced) 80%
+  in-car limit. Observed 2026-05-03: car charged 59% -> 80% in 90 min
+  pulling ~10 kW from the grid because SOLAR's throttle-down BLE was
+  silently suppressed.
+- ROOT CAUSE: Conflict between two correct-in-isolation behaviors.
+  v4.0.20 zeroes state.current_amps on session-start (to fix a stale-48A
+  deadlock where SOLAR thought it was already at 48A in strong sun and
+  never sent BLE). The pre-existing line ~1914 guard skips BLE when
+  current_amps==0 + excess<=0 (to respect user-initiated app charges).
+  Together they meant: every session-start with no sun -> "skip BLE" ->
+  car keeps whatever amps the disconnect-edge had set (48A).
+- FIX: Add state.disconnect_normalize_amps_succeeded flag. Set true when
+  disconnect-edge or pending-retry successfully BLE-set the car to
+  MAX_AMPS. Consumed on session-start: if true, seed current_amps=MAX_AMPS
+  (truthful — we just put it there); else current_amps=0 (preserves the
+  line ~1914 external-charge guard for Tesla app workflows).
+- PRESERVES: v4.0.20 stale-48A protection still works — current_amps is
+  now truthful (we set the car to 48A) instead of stale-from-last-session.
+  Tesla app respect still works — when the user app-starts a charge while
+  plugged in continuously (no session edge), no normalize ran, the flag
+  stays false, current_amps stays 0, and line ~1914 hands off.
+
+v4.0.23-twc - Charge-limit reset bugfixes (force= + calendar-exit + startup reconcile)
+- BUG FIX (Critical): TWC disconnect-edge handler was structurally unable to
+  send the paired set_charge_limit(80) BLE command. After set_charging_amps
+  succeeded, ble_call set state.ble_command_this_loop=True, and the second
+  ble_allowed() check at line ~1109 always returned False due to the
+  one-per-loop guard. Result: on every TWC unplug, only the amp normalization
+  fired; the charge-limit reset was silently dropped. Same dead-code bug in
+  the on-reconnect retry handler. Fix: added force= parameter to ble_allowed/
+  ble_call/set_charge_limit that bypasses the per-loop guard and inter-call
+  cooldown (but still respects backoff). Disconnect-edge and reconnect-retry
+  use force=True for the paired limit-set after sleeping 5s. New state field
+  pending_disconnect_limit_reset tracks failures of just the limit so the
+  reconnect path can retry it independently.
+- BUG FIX: CALENDAR-exit reset only fired when state.last_charge_limit_set <
+  DEFAULT_BATTERY_TARGET — i.e., only when calendar set a LOWER limit. With
+  above-80 approval (cal_target up to 95%), exit needs to reset DOWN. Changed
+  to '!= DEFAULT_BATTERY_TARGET' so it resets in either direction.
+- FEATURE: Startup / state-loss reconciliation. When state.last_charge_limit_set
+  is None (container restart, or a previous BLE attempt failed silently) and
+  no calendar advisory is active, the SOLAR-path now asserts
+  DEFAULT_BATTERY_TARGET as the baseline. Self-throttling via the cache
+  (succeeds once, never re-sends). This closes the gap where a container
+  rebuild during/after a calendar session could leave the car at a stale
+  high limit forever.
+- INVARIANTS PRESERVED: ble_allowed() still respects backoff for forced calls
+  so a real BLE failure on the first call defers the second. All mode-specific
+  BLE flows (MANUAL/CALENDAR/EMERGENCY/SOLAR stability) unchanged — they don't
+  use force= and continue to obey the one-per-loop guard.
+- DEFERRED FOLLOW-UPS:
+  1. MANUAL "Charging complete - skipping BLE commands" path (battery >= 80%
+     + state=Complete) early-bails without considering whether the limit is
+     wrong. If a stale higher limit lives on the car when MANUAL is toggled
+     and battery is already above target, MANUAL won't lower it. Consider
+     letting MANUAL run the same limit-mismatch reconciliation Fix C does.
+  2. pending_disconnect_limit_reset retry currently only runs on the TWC
+     connect-edge (one shot). If the limit reset still fails there, the flag
+     persists but isn't retried until the next connect edge. Fix C covers
+     this in practice (because last_charge_limit_set stays None after a
+     failed BLE), but the two flags duplicate intent. Consider unifying or
+     having an independent per-loop retry path that doesn't rely on edges.
+  3. Fix A uses force=True to send two BLE commands ~5 seconds apart in the
+     same loop. The car accepted this in live testing on 2026-05-02. If the
+     car ever rejects back-to-back BLE commands (e.g. firmware change), the
+     fallback is to split disconnect-edge into two loop iterations — track
+     pending_disconnect_limit_reset eagerly and let the next loop send it.
+
+v4.0.22-twc - 1Hz signal ring buffer (Option B plumbing)
+- FEATURE: Background thread polls localhost:8080/api/envoy_data at 1 Hz and
+  fills a 60-second thread-safe ring buffer (SignalBuffer). The dashboard route
+  is itself fed by envoy_logger.service's SSE stream (1 Hz), so per-tick
+  freshness drops from ~30s to ~1-6s. NO additional load on the Envoy device:
+  envoy_logger keeps a single persistent /stream/meter connection; all internal
+  consumers (dashboard, this charger) read from in-memory state.
+- REFACTOR: get_solar_data() now returns the latest buffer sample. Falls back to
+  a synchronous HTTP call only on poller startup or extended buffer staleness
+  (>SIGNAL_STALE_SEC), preserving prior behavior in the cold-start path.
+- OBSERVABILITY: Per-loop log line shows buffer count, mean/median/p25 excess,
+  max grid import in last 5s, and max envoy SSE age. These statistics are
+  logged but do not yet influence charging decisions — that's a deferred
+  follow-up (asymmetric ramp / fast-drop / median-based decisions / post-BLE
+  verification) once we have a few days of telemetry to tune against.
+- INVARIANTS PRESERVED: LOOP_INTERVAL=30, MAX_AMP_STEP=4, SMOOTH_WINDOW=3,
+  AMP_STABILITY_BAND=2, BLE_COOLDOWN=12, all SOLAR/MANUAL/CALENDAR/EMERGENCY
+  mode logic, all session/disconnect/wake-escalation paths from v4.0.16-v4.0.21
+  are unchanged. This is plumbing only.
 
 v4.0.20-twc - Reset current_amps on session start (stale-48A fix)
 - BUG FIX: Disconnect normalization set current_amps=48, which survived into the next
@@ -153,20 +343,21 @@ Solar Charger - BLE Edition v3.6.6 / v3.6.5 / v3.6.4
 ================================================================================
 """
 
-VERSION = "v4.0.20-twc"
+VERSION = "v4.0.27-twc"
 
 import time
 import subprocess
 import requests
 import os
+import threading
 from datetime import datetime
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional, Deque, Dict, Any
+from typing import Optional, Deque, Dict, Any, List, Tuple
 
 
 # -------------------------------
-# CONFIG (unchanged)
+# CONFIG (set TESLA_VIN and TESLA_EMAIL via environment)
 # -------------------------------
 VIN = os.getenv("TESLA_VIN", "")
 KEY_FILE = "/app/private.pem"
@@ -178,7 +369,7 @@ TESLA_EMAIL = os.getenv("TESLA_EMAIL", "")
 # -------------------------------
 SOLAR_API_BASE = os.getenv(
     "SOLAR_API_BASE",
-    "http://localhost"  # All services on pinasi (Pi 5) since Dec 2025 migration
+    "http://localhost"  # Dashboard + TWC API base (--net=host => host localhost)
 )
 
 PI2_SOLAR_URL = f"{SOLAR_API_BASE}:8080/api/envoy_data"
@@ -191,13 +382,30 @@ TWC_STATUS_URL = f"{SOLAR_API_BASE}:5002/api/twc/status"
 # BLE RELAY CONFIG (Pi Zero proxy)
 # -------------------------------
 BLE_RELAY_ENABLED = os.getenv("BLE_RELAY_ENABLED", "true").lower() == "true"
-BLE_RELAY_HOST = os.getenv("BLE_RELAY_HOST", "SolarPiZero")
+BLE_RELAY_HOST = os.getenv("BLE_RELAY_HOST", "192.168.1.100")
 BLE_RELAY_PORT = int(os.getenv("BLE_RELAY_PORT", "5003"))
 BLE_RELAY_URL = f"http://{BLE_RELAY_HOST}:{BLE_RELAY_PORT}"
-BLE_RELAY_API_KEY = os.getenv("BLE_RELAY_API_KEY", "")
+BLE_RELAY_API_KEY = os.getenv("BLE_RELAY_API_KEY")
+if BLE_RELAY_ENABLED and not BLE_RELAY_API_KEY:
+    raise RuntimeError("BLE_RELAY_API_KEY must be set when BLE_RELAY_ENABLED=true")
 
 TWC_CACHE_TTL = 15
 TWC_STALE_THRESHOLD = 90
+SOLAR_DATA_STALE_SEC = 600  # 10 minutes — triggers 48A failsafe in SOLAR mode during outage
+
+# -------------------------------
+# 1Hz SIGNAL BUFFER (v4.0.22 - Option B plumbing)
+# -------------------------------
+# Background thread polls PI2_SOLAR_URL at 1 Hz and fills a ring buffer.
+# The dashboard endpoint is itself SSE-fed (envoy_logger.service holds the
+# single /stream/meter connection on the network — see CLAUDE.md). Adding this
+# in-process consumer adds ZERO additional load on the Envoy device; only
+# loopback HTTP traffic to localhost:8080 is added.
+SIGNAL_POLL_INTERVAL_SEC = 1.0   # 1 Hz polling cadence
+SIGNAL_POLL_TIMEOUT = 4          # Localhost should respond instantly; tight timeout
+SIGNAL_BUFFER_MAXLEN = 60        # Keep ~60 seconds of samples
+SIGNAL_STALE_SEC = 30            # Buffer considered unusable if no fresh sample in this window
+SIGNAL_LOG_QUIET_FAILURES = 30   # Only log every Nth consecutive poll failure to avoid log spam
 
 # GPS constants REMOVED in TWC fork - TWC connection is authoritative for home detection
 
@@ -218,6 +426,16 @@ AMP_STABILITY_BAND = 2
 MAX_AMP_STEP = 4  # Max amp increase per loop (Envoy updates every 60s, loop is 30s)
 SMOOTH_WINDOW = 3
 SUSTAINED_NIGHT_SEC = 600
+
+# v4.0.27: SOLAR-mode decisions now use the 1Hz buffer signals (median for
+# steady-state, excess_smooth for cliff detection) plus three gates layered
+# over the existing stability/threshold logic. Validated against May 7 2026
+# telemetry — replay harness in replay_v4_0_27.py.
+FAST_DROP_IMPORT_W = 3000        # max_import_5s threshold to bypass stability count
+SSE_STALE_THRESHOLD_S = 30       # envoy_age_max above this -> hold both directions
+SSE_FRESH_THRESHOLD_S = 15       # consecutive samples below this rebuild ramp authority
+SSE_FRESH_RECOVERY_LOOPS = 2     # fresh loops required before resuming UP steps
+TWC_TRACKING_TOLERANCE_A = 4     # twc must be within this of cmd to ramp UP
 
 BLE_COOLDOWN = 12
 BLE_BACKOFF_INITIAL = 60
@@ -268,6 +486,18 @@ class ChargerState:
     ble_backoff_until: float = 0.0
     ble_fail_count: int = 0
 
+    # v4.0.25: timestamp of the last *successful* charging-set-amps BLE command.
+    # Distinct from last_ble_time which covers ALL BLE (start/stop/limit too).
+    # Used only for telemetry (Charge: log line) — does not influence decisions.
+    last_ble_amp_command_t: float = 0.0
+
+    # v4.0.27: SSE-stale recovery counter. Increments by 1 each loop where
+    # envoy_age_max < SSE_FRESH_THRESHOLD_S, decays to 0 the moment age
+    # exceeds SSE_STALE_THRESHOLD_S. UP-step ramp authority requires
+    # >= SSE_FRESH_RECOVERY_LOOPS to prevent greedy ramp on a single fresh
+    # sample after a stale window (May 4 2026 14:14:59 phantom +11kW event).
+    fresh_recovery_count: int = 0
+
     # Charge limit cache - avoid redundant BLE calls
     last_charge_limit_set: Optional[int] = None
 
@@ -297,12 +527,173 @@ class ChargerState:
     pending_disconnect_amp_normalization: bool = False
     pending_disconnect_reason: Optional[str] = None
 
+    # --- v4.0.23: Independent limit-reset retry ---
+    # Set when the disconnect-edge sent the amp normalization OK but the
+    # follow-up set_charge_limit(80) failed (backoff). The next loop or the
+    # reconnect path retries the limit independently of amps.
+    pending_disconnect_limit_reset: bool = False
+
+    # --- v4.0.24: Truthful current_amps seed on session start ---
+    # Set true when the disconnect-edge (or pending retry) successfully
+    # set the car to MAX_AMPS via BLE. Consumed on the next session-start
+    # to seed state.current_amps = MAX_AMPS instead of zeroing it, so SOLAR
+    # can throttle down a no-sun replug. If false at session-start (e.g.
+    # disconnect-edge BLE failed, or wife started a charge via Tesla app
+    # without us seeing a session edge), current_amps stays 0 and the
+    # line ~1914 "external charge" guard respects the user's intent.
+    disconnect_normalize_amps_succeeded: bool = False
+
     # --- v4.0.3: Dashboard warning flags ---
     grid_charge_warning_amps: Optional[float] = None
     relay_unreachable_streak: int = 0
     relay_unreachable_alert: bool = False
 
 state = ChargerState()
+
+
+# -------------------------------
+# 1Hz SIGNAL BUFFER (v4.0.22 - Option B plumbing)
+# -------------------------------
+@dataclass
+class SignalSample:
+    """One sample from the 1Hz background poller."""
+    t: float            # Wall clock when this sample was captured
+    production_w: float
+    excess_w: float
+    consumption_w: float
+    envoy_age_sec: float  # envoy_data_age_seconds reported by dashboard (SSE event age + cache age)
+    voltage_v: float = 0.0  # v4.0.26: avg grid voltage from envoy SSE (telemetry only)
+
+
+class SignalBuffer:
+    """Thread-safe ring buffer of recent solar samples.
+
+    Producer: signal_poller_loop() at ~1Hz.
+    Consumer: main charger loop (get_solar_data, signal stats logging).
+
+    All public methods take the lock and return immutable snapshots so callers
+    never see the underlying deque.
+    """
+
+    def __init__(self, maxlen: int = SIGNAL_BUFFER_MAXLEN):
+        self._buf: Deque[SignalSample] = deque(maxlen=maxlen)
+        self._lock = threading.Lock()
+        self._last_success_t: float = 0.0
+        self._consecutive_failures: int = 0
+        self._failures_total: int = 0
+
+    def append(self, sample: SignalSample) -> None:
+        with self._lock:
+            self._buf.append(sample)
+            self._last_success_t = sample.t
+            self._consecutive_failures = 0
+
+    def record_failure(self) -> int:
+        """Returns the new consecutive-failure count (for log throttling)."""
+        with self._lock:
+            self._consecutive_failures += 1
+            self._failures_total += 1
+            return self._consecutive_failures
+
+    def latest(self) -> Optional[SignalSample]:
+        with self._lock:
+            return self._buf[-1] if self._buf else None
+
+    def snapshot(self) -> Tuple[List[SignalSample], float, int, int]:
+        """Returns (samples_copy, last_success_t, consecutive_failures, failures_total)."""
+        with self._lock:
+            return (list(self._buf), self._last_success_t,
+                    self._consecutive_failures, self._failures_total)
+
+
+signal_buf = SignalBuffer()
+
+
+def signal_poller_loop() -> None:
+    """Background thread: poll PI2_SOLAR_URL at 1 Hz and append to signal_buf.
+
+    No retry logic on failure — we just record it and try again next tick.
+    The buffer's stale-detection in get_solar_data() handles fallback to a
+    synchronous call if we drift too far behind.
+    """
+    log(f"Signal poller thread starting (interval={SIGNAL_POLL_INTERVAL_SEC}s, "
+        f"buffer={SIGNAL_BUFFER_MAXLEN} samples)")
+    while True:
+        t0 = time.time()
+        try:
+            r = requests.get(PI2_SOLAR_URL, timeout=SIGNAL_POLL_TIMEOUT)
+            r.raise_for_status()
+            data = r.json()
+            sample = SignalSample(
+                t=time.time(),
+                production_w=float(data.get('production_watts', 0) or 0),
+                excess_w=float(data.get('excess_watts', 0) or 0),
+                consumption_w=float(data.get('consumption_watts', 0) or 0),
+                envoy_age_sec=float(data.get('envoy_data_age_seconds') or 0),
+                voltage_v=float(data.get('voltage_v') or 0.0),
+            )
+            signal_buf.append(sample)
+        except Exception as e:
+            fails = signal_buf.record_failure()
+            # Log first failure of a streak, then every Nth, to avoid log spam during outages
+            if fails == 1 or fails % SIGNAL_LOG_QUIET_FAILURES == 0:
+                log(f"Signal poller error (consecutive={fails}): {type(e).__name__}: {e}")
+
+        elapsed = time.time() - t0
+        sleep_for = max(0.0, SIGNAL_POLL_INTERVAL_SEC - elapsed)
+        time.sleep(sleep_for)
+
+
+def _percentile(sorted_vals: List[float], p: float) -> float:
+    """Simple percentile (no numpy dep). p is in [0, 1]. Assumes sorted input."""
+    if not sorted_vals:
+        return 0.0
+    idx = int(p * (len(sorted_vals) - 1))
+    return sorted_vals[idx]
+
+
+def get_signal_stats() -> Optional[Dict[str, Any]]:
+    """Compute observability stats over the ring buffer.
+
+    Returns None if buffer is empty or stale (caller logs nothing rather than
+    misleading numbers). Logged each main loop but does NOT yet drive
+    decisions — that's a deferred follow-up PR.
+    """
+    samples, last_t, fails, fails_total = signal_buf.snapshot()
+    now = time.time()
+    if not samples:
+        return None
+
+    age_sec = now - last_t
+    if age_sec > SIGNAL_STALE_SEC:
+        return {'stale': True, 'age_sec': age_sec, 'count': len(samples),
+                'consecutive_failures': fails, 'failures_total': fails_total}
+
+    excess_vals = sorted(s.excess_w for s in samples)
+    prod_vals = [s.production_w for s in samples]
+    n = len(samples)
+
+    # Fast-drop signal: max grid import (= -excess_w) over the last 5 seconds.
+    # Used for observability now; will drive fast-drop logic in a follow-up.
+    recent_5s = [s for s in samples if (now - s.t) <= 5.0]
+    max_import_5s = max((-s.excess_w for s in recent_5s), default=0.0)
+
+    return {
+        'stale': False,
+        'count': n,
+        'window_sec': now - samples[0].t,
+        'age_sec': age_sec,
+        'excess_mean': sum(excess_vals) / n,
+        'excess_median': _percentile(excess_vals, 0.5),
+        'excess_p25': _percentile(excess_vals, 0.25),
+        'excess_p75': _percentile(excess_vals, 0.75),
+        'production_mean': sum(prod_vals) / n,
+        'max_import_5s': max_import_5s,
+        'envoy_age_max': max(s.envoy_age_sec for s in samples),
+        'consecutive_failures': fails,
+        'failures_total': fails_total,
+    }
+
 
 # -------------------------------
 # Helper: report Tesla OAuth token presence at startup
@@ -413,12 +804,36 @@ def get_twc_current_amps():
 # Solar / Dashboard helpers
 # -------------------------------
 def get_solar_data():
+    """Return the freshest solar sample.
+
+    Primary path (v4.0.22+): read the most-recent sample from the 1Hz ring
+    buffer populated by signal_poller_loop(). Steady-state freshness is
+    ~1-2 seconds (poller cadence + dashboard cache + envoy_logger SSE event age).
+
+    Fallback path: synchronous HTTP call to the dashboard. Used on poller
+    cold-start (buffer empty) or extended buffer staleness (>SIGNAL_STALE_SEC,
+    e.g. dashboard down for >30s). Preserves the legacy 30s-timeout behavior so
+    the failure mode of this function is identical to v4.0.21 in the worst case.
+    """
+    sample = signal_buf.latest()
+    if sample is not None:
+        age = time.time() - sample.t
+        if age <= SIGNAL_STALE_SEC:
+            return {
+                'production': sample.production_w,
+                'excess': sample.excess_w,
+                'data_age_seconds': sample.envoy_age_sec,
+            }
+        log(f"WARN get_solar_data: ring buffer stale ({age:.1f}s); "
+            f"falling back to synchronous fetch")
+
     try:
         r = requests.get(PI2_SOLAR_URL, timeout=30)  # Verified: 30s timeout
         data = r.json()
         production = float(data.get('production_watts', 0) or 0)
         excess = float(data.get('excess_watts', 0) or 0)
-        return {'production': production, 'excess': excess}
+        data_age = data.get('envoy_data_age_seconds')
+        return {'production': production, 'excess': excess, 'data_age_seconds': data_age}
     except Exception as e:
         log(f"ERROR get_solar_data: {e}")
         return None
@@ -589,14 +1004,22 @@ def wake_vehicle_safe(reason: str = 'manual'):
 # -------------------------------
 # BLE helpers
 # -------------------------------
-def ble_allowed():
-    """Check if BLE command is allowed (cooldown + backoff + one per loop)."""
+def ble_allowed(force=False):
+    """Check if BLE command is allowed (cooldown + backoff + one per loop).
+
+    force=True bypasses the one-per-loop guard and the inter-call cooldown,
+    but the post-failure backoff still applies. Used by paired BLE flows
+    (e.g. disconnect-edge "set 48A then set 80%") where the second call has
+    already waited a few seconds and just needs to bypass the per-loop budget.
+    Backoff is still respected so a real BLE failure on the first call still
+    defers the second call.
+    """
     now = time.time()
-    if state.ble_command_this_loop:
+    if not force and state.ble_command_this_loop:
         return False
     if now < state.ble_backoff_until:
         return False
-    if (now - state.last_ble_time) < BLE_COOLDOWN:
+    if not force and (now - state.last_ble_time) < BLE_COOLDOWN:
         return False
     return True
 
@@ -690,13 +1113,17 @@ def calculate_ble_backoff():
     return min(backoff_time, BLE_MAX_BACKOFF)
 
 
-def ble_call(cmd, val=None, domain='infotainment'):
-    """Execute a BLE command with gating and backoff."""
-    if state.ble_command_this_loop:
+def ble_call(cmd, val=None, domain='infotainment', force=False):
+    """Execute a BLE command with gating and backoff.
+
+    force=True bypasses the one-per-loop guard and the cooldown (but not the
+    backoff). See ble_allowed() for rationale.
+    """
+    if not force and state.ble_command_this_loop:
         log(f"BLE >>> {cmd} skipped (already used BLE this loop)")
         return False
 
-    if not ble_allowed():
+    if not ble_allowed(force=force):
         remaining = max(0, state.ble_backoff_until - time.time())
         if remaining > 0:
             log(f"BLE >>> {cmd} gated (backoff {remaining:.0f}s remaining)")
@@ -758,7 +1185,7 @@ def ble_call(cmd, val=None, domain='infotainment'):
         if state.relay_unreachable_streak >= RELAY_UNREACHABLE_ALERT_THRESHOLD:
             if not state.relay_unreachable_alert:
                 log(
-                    f"ALERT: BLE relay unreachable for "
+                    f"⚠️ ALERT: BLE relay unreachable for "
                     f"{state.relay_unreachable_streak} consecutive attempts"
                 )
             state.relay_unreachable_alert = True
@@ -772,11 +1199,16 @@ def ble_call(cmd, val=None, domain='infotainment'):
 # -------------------------------
 # High-level BLE actions
 # -------------------------------
-def set_charge_limit(percent):
-    """Set charge limit - uses cache to avoid redundant BLE calls."""
+def set_charge_limit(percent, force=False):
+    """Set charge limit - uses cache to avoid redundant BLE calls.
+
+    force=True bypasses the one-per-loop and cooldown gates (but not backoff)
+    so paired flows like the TWC disconnect-edge can send amps + limit in the
+    same loop. See ble_allowed() for force semantics.
+    """
     if state.last_charge_limit_set == percent:
         return True
-    if ble_call('charging-set-limit', percent):
+    if ble_call('charging-set-limit', percent, force=force):
         state.last_charge_limit_set = percent
         return True
     return False
@@ -788,6 +1220,7 @@ def set_charging_amps(amps):
         state.current_amps = amps
         if amps > state.session_peak_amps:
             state.session_peak_amps = amps
+        state.last_ble_amp_command_t = time.time()  # v4.0.25 telemetry
         return True
     return False
 
@@ -812,19 +1245,28 @@ def stop_charging():
 # -------------------------------
 # Charging logic
 # -------------------------------
-def calculate_target_amps(excess_watts, current_amps):
-    """Calculate target amps by adding excess-based delta to current charging.
+def calculate_target_amps(excess_watts, baseline_amps, voltage_v=None):
+    """Calculate target amps by adding excess-based delta to a baseline.
 
-    Rate-limits increases to MAX_AMP_STEP per loop to allow measurements to catch up.
-    Decreases are not rate-limited to quickly reduce grid imports.
+    baseline_amps is normally state.current_amps (what we last commanded).
+    Rate-limits increases to MAX_AMP_STEP per loop. Decreases are unlimited.
+
+    voltage_v (v4.0.27): per-phase voltage from the 1Hz buffer. When a sane
+    reading is available, divide by 2*voltage_v to use real split-phase
+    voltage (~246V) instead of the 240V assumption — the May 2026 telemetry
+    showed a consistent +2.5% bias in commanded amps from this.
     """
-    delta = int(excess_watts / VOLTAGE)
+    if voltage_v is not None and 100 <= voltage_v <= 130:
+        divisor = voltage_v * 2  # split-phase
+    else:
+        divisor = VOLTAGE        # fallback to 240V assumption
+    delta = int(excess_watts / divisor)
 
     # Rate-limit increases only (decreases can be immediate to avoid grid import)
     if delta > MAX_AMP_STEP:
         delta = MAX_AMP_STEP
 
-    target = current_amps + delta
+    target = baseline_amps + delta
     return max(MIN_AMPS, min(target, MAX_AMPS))
 
 
@@ -849,8 +1291,14 @@ def main():
     log(f"TWC Disconnect: Auto-reset to {MAX_AMPS}A enabled")
     log(f"Emergency fallback runtime: {int(MAX_EMERGENCY_RUNTIME/60)} minutes")
     log(f"Emergency telemetry refresh: {EMERGENCY_STATUS_INTERVAL}s")
+    log(f"Signal buffer: 1Hz polling, {SIGNAL_BUFFER_MAXLEN}-sample window, "
+        f"stale={SIGNAL_STALE_SEC}s")
     log("TWC FORK: Home detection via TWC only (no GPS fallback)")
     log("=" * 60)
+
+    # Start 1Hz signal poller thread (v4.0.22 - Option B plumbing).
+    # Daemon=True so it dies with the main thread on container shutdown.
+    threading.Thread(target=signal_poller_loop, daemon=True, name="signal_poller").start()
 
     # Initial Tesla status (TWC fork: 2-tuple return)
     battery, charging_state = get_tesla_status()
@@ -892,9 +1340,17 @@ def main():
             if ble_allowed():
                 ok = set_charging_amps(MAX_AMPS)
                 if ok:
+                    state.disconnect_normalize_amps_succeeded = True
                     time.sleep(5)
-                    if ble_allowed():
-                        set_charge_limit(DEFAULT_BATTERY_TARGET)
+                    # v4.0.23: force=True bypasses one-per-loop + cooldown so
+                    # the limit-set actually fires after the amp-set in the
+                    # same loop. Backoff still applies, so a real BLE failure
+                    # on amps still defers the limit attempt.
+                    if set_charge_limit(DEFAULT_BATTERY_TARGET, force=True):
+                        log(f"  └─ Disconnect normalize complete: 48A + {DEFAULT_BATTERY_TARGET}%")
+                    else:
+                        state.pending_disconnect_limit_reset = True
+                        log("  └─ Disconnect limit reset failed; will retry next loop")
                 else:
                     state.pending_disconnect_amp_normalization = True
                     state.pending_disconnect_reason = "BLE attempt failed on disconnect edge"
@@ -910,9 +1366,20 @@ def main():
         if state.last_twc_state is False and twc_state is True:
             state.session_start_ts = time.time()
             state.session_peak_amps = 0
-            state.current_amps = 0  # Force SOLAR to recalculate from scratch (not from stale disconnect value)
+            # v4.0.24: If disconnect-edge successfully normalized the car to
+            # MAX_AMPS via BLE, seed current_amps with that truthful value so
+            # SOLAR can throttle down on a no-sun replug. Otherwise zero it,
+            # which keeps the line ~1914 "external charge" guard respecting
+            # user-initiated app charges (wife's Tesla app workflow).
+            if state.disconnect_normalize_amps_succeeded:
+                state.current_amps = MAX_AMPS
+                state.disconnect_normalize_amps_succeeded = False
+                log(f"🔋 New session: seeding current_amps={MAX_AMPS}A (disconnect normalize was ours)")
+            else:
+                state.current_amps = 0
+                log(f"🔋 New session: resetting current_amps=0 (no prior normalize — respect external charge)")
             log("📊 SESSION STARTED: tracking begins")
-            log(f"🔋 New session: resetting BLE + emergency state + current_amps")
+            log(f"🔋 New session: resetting BLE + emergency state")
 
             # Invalidate stale Tesla status — new session needs fresh data
             state.cached_ts = 0.0
@@ -926,10 +1393,19 @@ def main():
                 if ble_allowed():
                     ok = set_charging_amps(MAX_AMPS)
                     if ok:
-                        log("  └─ Pending normalize retry succeeded")
+                        # v4.0.24: pending-retry succeeded after session-start
+                        # already zeroed current_amps. Seed it now so SOLAR
+                        # throttle-down works on this session.
+                        state.current_amps = MAX_AMPS
+                        log(f"  └─ Pending normalize retry succeeded (current_amps seeded to {MAX_AMPS}A)")
                         time.sleep(5)
-                        if ble_allowed():
-                            set_charge_limit(DEFAULT_BATTERY_TARGET)
+                        # v4.0.23: force=True so the paired limit-set actually
+                        # fires (was dead-coded by ble_command_this_loop guard).
+                        if set_charge_limit(DEFAULT_BATTERY_TARGET, force=True):
+                            log(f"  └─ Pending limit reset succeeded ({DEFAULT_BATTERY_TARGET}%)")
+                        else:
+                            state.pending_disconnect_limit_reset = True
+                            log("  └─ Pending limit reset still failed; will retry")
                     else:
                         log("  └─ Pending normalize retry failed")
                 else:
@@ -937,6 +1413,20 @@ def main():
 
                 state.pending_disconnect_amp_normalization = False
                 state.pending_disconnect_reason = None
+
+            # v4.0.23: Independent limit-reset retry. Amps already normalized
+            # in a prior loop, but the paired limit-set failed. Retry just the
+            # limit (no force needed — fresh loop).
+            elif state.pending_disconnect_limit_reset:
+                log("🔁 Pending limit reset retry")
+                if ble_allowed():
+                    if set_charge_limit(DEFAULT_BATTERY_TARGET):
+                        log(f"  └─ Pending limit reset succeeded ({DEFAULT_BATTERY_TARGET}%)")
+                        state.pending_disconnect_limit_reset = False
+                    else:
+                        log("  └─ Pending limit reset still failed; will retry next loop")
+                else:
+                    log("  └─ Pending limit reset gated; will retry next loop")
 
         state.last_twc_state = twc_state
 
@@ -1270,28 +1760,7 @@ def main():
                 effective_target = cal_target
 
                 if cal_target > 80 and not above_80_approved:
-                    # Auto-approve if <2 hours before event
-                    event_start_iso = calendar_advisory.get('event_start_iso', '')
-                    try:
-                        event_ts = datetime.fromisoformat(
-                            event_start_iso.replace("Z", "+00:00")
-                        ).timestamp()
-                    except Exception:
-                        event_ts = calendar_advisory.get('expires_at', 0)
-                    hours_to_event = (event_ts - time.time()) / 3600
-
-                    if hours_to_event < 2:
-                        log(f"CALENDAR: Auto-approving above-80% ({hours_to_event:.1f}h to event)")
-                        above_80_approved = True
-                        # Persist auto-approval so dashboard sees it
-                        try:
-                            cfg_path = f"{SOLAR_API_BASE}:8080/api/calendar/approve_above_80"
-                            requests.post(cfg_path, json={}, timeout=3)
-                        except Exception:
-                            pass  # Best-effort; charger will keep re-approving
-
-                    if not above_80_approved:
-                        effective_target = 80
+                    effective_target = 80
 
                 if battery < effective_target:
                     mode = 'CALENDAR'
@@ -1392,14 +1861,33 @@ def main():
         # If we just exited CALENDAR mode, reset for SOLAR charging
         if was_in_calendar and not state.last_calendar_mode:
             state.current_amps = 0  # Force SOLAR to recalculate from scratch
+            # v4.0.23: was '< DEFAULT_BATTERY_TARGET' which only handled the
+            # case where calendar set a LOWER limit. With above-80 approval
+            # (e.g. cal_target=95), the limit needs to be reset DOWN. Use !=
+            # so we reset in either direction.
             if (state.last_charge_limit_set is not None
-                    and state.last_charge_limit_set < DEFAULT_BATTERY_TARGET):
+                    and state.last_charge_limit_set != DEFAULT_BATTERY_TARGET):
                 log(f"CALENDAR exit: resetting charge limit "
                     f"{state.last_charge_limit_set}% -> {DEFAULT_BATTERY_TARGET}%")
                 if ble_allowed():
                     set_charge_limit(DEFAULT_BATTERY_TARGET)
                 else:
                     state.last_charge_limit_set = None  # Ensure retry
+
+        # v4.0.23: Startup / state-loss reconciliation. If we don't know the
+        # car's charge limit (e.g. container just restarted, or a previous
+        # set_charge_limit failed silently), assert DEFAULT_BATTERY_TARGET as
+        # the baseline. We only reach this point when no active CALENDAR is
+        # driving the limit and we're not in MANUAL/EMERGENCY (those modes
+        # 'continue' earlier in the loop), so SOLAR/NIGHT-path is the right
+        # place to reconcile. The set_charge_limit cache prevents re-sending
+        # once it succeeds.
+        if (state.last_charge_limit_set is None
+                and not calendar_active
+                and ble_allowed()):
+            log(f"Startup reconcile: charge limit unknown - asserting "
+                f"{DEFAULT_BATTERY_TARGET}% baseline")
+            set_charge_limit(DEFAULT_BATTERY_TARGET)
 
         # If car is Complete below target, reset stale amps and raise charge limit
         if (charging_state == 'Complete'
@@ -1435,6 +1923,51 @@ def main():
             f"Solar: {production:.0f}W prod, {excess:.0f}W excess "
             f"(smoothed: {prod_smooth:.0f}W / {excess_smooth:.0f}W)"
         )
+
+        # 1Hz buffer observability (v4.0.22). Stats only — does NOT yet drive
+        # decisions. Used to validate buffer health and to gather data for
+        # tuning the future asymmetric-ramp / fast-drop / median-based logic.
+        sig_stats = get_signal_stats()
+        if sig_stats is None:
+            log("Signal: ring buffer empty (poller cold-start or extended outage)")
+        elif sig_stats.get('stale'):
+            log(f"Signal: ring buffer STALE age={sig_stats['age_sec']:.1f}s "
+                f"count={sig_stats['count']} "
+                f"fails_consec={sig_stats['consecutive_failures']} "
+                f"fails_total={sig_stats['failures_total']}")
+        else:
+            log(f"Signal: n={sig_stats['count']} "
+                f"window={sig_stats['window_sec']:.1f}s "
+                f"age={sig_stats['age_sec']:.1f}s "
+                f"excess(p25/med/mean/p75)="
+                f"{sig_stats['excess_p25']:.0f}/"
+                f"{sig_stats['excess_median']:.0f}/"
+                f"{sig_stats['excess_mean']:.0f}/"
+                f"{sig_stats['excess_p75']:.0f}W "
+                f"max_import_5s={sig_stats['max_import_5s']:.0f}W "
+                f"envoy_age_max={sig_stats['envoy_age_max']:.1f}s "
+                f"fails_total={sig_stats['failures_total']}")
+
+        # v4.0.25 telemetry: per-loop TWC actual amps + ble_amp_age.
+        # Pure observability, fed into phase2_telemetry CSVs for tuning the
+        # post-BLE settle window and TWC-vs-commanded ramp model. Does NOT
+        # affect decisions in this release.
+        twc_actual = get_twc_current_amps()
+        if state.last_ble_amp_command_t > 0:
+            ble_amp_age_str = f"{time.time() - state.last_ble_amp_command_t:.1f}s"
+        else:
+            ble_amp_age_str = "never"
+        twc_str = f"{twc_actual:.1f}A" if twc_actual is not None else "?"
+        # v4.0.26: voltage from latest signal sample (telemetry-only)
+        latest_sample = signal_buf.latest()
+        if latest_sample is not None and latest_sample.voltage_v > 0:
+            volt_str = f"{latest_sample.voltage_v:.1f}V"
+        else:
+            volt_str = "?"
+        log(f"Charge: twc_actual={twc_str} cmd={state.current_amps}A "
+            f"ble_amp_age={ble_amp_age_str} "
+            f"volt={volt_str} "
+            f"state={state.cached_charging_state or '?'}")
 
         # ========================================
         # 4) NIGHT DETECTION (with freshness check)
@@ -1516,6 +2049,22 @@ def main():
         if mode not in ('CALENDAR_WAITING',):
             mode = 'SOLAR'
 
+        # Stale Envoy data failsafe: if solar signal has been unavailable for 10+ minutes,
+        # charge at MAX_AMPS rather than holding stale excess values.
+        # Only reachable in SOLAR mode — NIGHT mode continues before this point.
+        data_age = solar.get('data_age_seconds')
+        if data_age is not None and data_age > SOLAR_DATA_STALE_SEC:
+            log(f"⚠️ SOLAR: Envoy data {data_age}s stale — no solar signal, failsafe {MAX_AMPS}A")
+            if state.current_amps != MAX_AMPS:
+                if ble_allowed():
+                    set_charging_amps(MAX_AMPS)
+            elif charging_state != 'Charging' and ble_allowed():
+                start_charging()
+            update_dashboard_status(mode, state.current_amps, MAX_AMPS, battery, 0, 0, charging_state or 'Unknown')
+            log(f"Loop duration: {time.time() - loop_start_ts:.1f}s")
+            time.sleep(LOOP_INTERVAL)
+            continue
+
         # [NEW] High Solar Wake-Up
         # If we have strong sustained solar excess but the car is not charging,
         # and BLE is currently blocked, the car may be in deep sleep.
@@ -1545,10 +2094,82 @@ def main():
                 time.sleep(LOOP_INTERVAL)
                 continue
 
-        raw_target = calculate_target_amps(excess_smooth, state.current_amps)
+        # ============================================================
+        # v4.0.27: median-based decisions, with three gates layered over
+        # the existing stability/threshold logic.
+        #   - decision_excess: 60-sample 1Hz median for steady-state ramp
+        #   - excess_smooth retained as the fast-drop trigger basis
+        #     (more responsive on transient cliffs than median)
+        #   - voltage_v: per-phase reading from v4.0.26 plumbing
+        # See replay_v4_0_27.py + SOLAR_TIGHTENING_PLAN.md.
+        # ============================================================
+        if sig_stats and not sig_stats.get('stale'):
+            decision_excess = sig_stats['excess_median']
+            sse_age = sig_stats['envoy_age_max']
+            mi5 = sig_stats['max_import_5s']
+        else:
+            decision_excess = excess_smooth
+            sse_age = 0.0
+            mi5 = 0.0
+
+        voltage_v = (latest_sample.voltage_v
+                     if latest_sample is not None and latest_sample.voltage_v > 0
+                     else None)
+
+        # ---- Stale-data freshness counter ----
+        if sse_age > SSE_STALE_THRESHOLD_S:
+            state.fresh_recovery_count = 0
+        elif sse_age < SSE_FRESH_THRESHOLD_S:
+            state.fresh_recovery_count = min(
+                state.fresh_recovery_count + 1, SSE_FRESH_RECOVERY_LOOPS + 1
+            )
+        sse_stale = sse_age > SSE_STALE_THRESHOLD_S
+        post_stale = state.fresh_recovery_count < SSE_FRESH_RECOVERY_LOOPS
+
+        # ---- Fast-drop on real cliff (excess_smooth, not median) ----
+        # excess_smooth leads median on transients because the 60s median is
+        # dragged up by older healthy samples for ~30-60s after a cloud edge.
+        if (mi5 >= FAST_DROP_IMPORT_W and excess_smooth < 0 and not sse_stale
+                and state.current_amps > MIN_AMPS and ble_allowed()):
+            log(f"SOLAR: FAST-DROP mi5={mi5:.0f}W smooth={excess_smooth:.0f}W "
+                f"-> {MIN_AMPS}A (bypassing stability count)")
+            set_charging_amps(MIN_AMPS)
+            update_dashboard_status(
+                mode, state.current_amps, MIN_AMPS, battery,
+                excess_smooth, prod_smooth, charging_state or 'Unknown'
+            )
+            log(f"Sleeping {LOOP_INTERVAL}s (mode={mode}, amps={state.current_amps})")
+            log(f"Loop duration: {time.time() - loop_start_ts:.1f}s")
+            time.sleep(LOOP_INTERVAL)
+            continue
+
+        raw_target = calculate_target_amps(decision_excess, state.current_amps, voltage_v)
         banded_target = (raw_target // AMP_STABILITY_BAND) * AMP_STABILITY_BAND
         banded_target = max(MIN_AMPS, banded_target)
-        log(f"Target: {raw_target}A raw -> {banded_target}A banded (current: {state.current_amps}A)")
+
+        # ---- TWC tracking gate on UPWARD steps only ----
+        # If the car visibly hasn't followed the last command, don't ramp
+        # further. Catches stuck-car scenarios (May 4 14:09, May 7 10:43)
+        # where cached charging_state lies but TWC tells the truth.
+        if (banded_target > state.current_amps
+                and twc_actual is not None
+                and twc_actual < (state.current_amps - TWC_TRACKING_TOLERANCE_A)):
+            log(f"SOLAR: TWC gate cmd={state.current_amps}A twc={twc_actual:.1f}A "
+                f"(>{TWC_TRACKING_TOLERANCE_A}A behind) — holding")
+            banded_target = state.current_amps
+
+        # ---- Stale-data freeze + post-stale recovery gate ----
+        if sse_stale:
+            log(f"SOLAR: SSE stale (age={sse_age:.0f}s) — holding {state.current_amps}A")
+            banded_target = state.current_amps
+        elif banded_target > state.current_amps and post_stale:
+            log(f"SOLAR: post-stale recovery ({state.fresh_recovery_count}/"
+                f"{SSE_FRESH_RECOVERY_LOOPS} fresh) — holding {state.current_amps}A")
+            banded_target = state.current_amps
+
+        log(f"Target: {raw_target}A raw -> {banded_target}A banded "
+            f"(current: {state.current_amps}A, basis: med={decision_excess:.0f}W "
+            f"v={voltage_v if voltage_v else 'fallback-240V'})")
 
         state.amp_target_history.append(banded_target)
 
@@ -1564,7 +2185,10 @@ def main():
                 else:
                     log(f"SOLAR: Car complete at {battery}% — suppressing BLE")
             elif abs(banded_target - state.current_amps) >= AMP_CHANGE_THRESHOLD:
-                if excess_smooth <= 0 and state.current_amps == 0:
+                # v4.0.27: switched from excess_smooth to decision_excess so
+                # the wife-Tesla-app guard lines up with the new median basis.
+                # current_amps==0 sentinel preserved (project_tesla_app_workflow).
+                if decision_excess <= 0 and state.current_amps == 0:
                     twc_amps = get_twc_current_amps()
                     # Only warn if TWC shows significantly more than MIN_AMPS
                     # If TWC shows ~6A, that's expected for solar mode with no excess

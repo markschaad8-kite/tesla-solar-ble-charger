@@ -1,0 +1,7 @@
+[Unit]
+Description=Solar Charger maintenance checker (emails on issues)
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/solar-charger-maintenance
+ExecStart=/usr/local/sbin/solar_charger_maintenance_check.sh

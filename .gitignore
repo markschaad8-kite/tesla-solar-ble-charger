@@ -1,0 +1,31 @@
+# Secrets — never commit
+private.pem
+*.pem
+*.key
+cache.json
+pi-zero-ble-relay/config.env
+*.env
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+*_venv/
+
+# Local backups of prior versions
+backups/
+
+# Phase 2 telemetry extract output (optional local tooling)
+phase2_telemetry/
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
+
+# Claude
+.claude/settings.local.json

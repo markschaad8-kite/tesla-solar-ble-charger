@@ -1,0 +1,36 @@
+[Unit]
+Description=Tesla Solar Charger (Podman)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+
+# Edit paths to match your install. Same file can hold relay API_KEY + TESLA_VIN for
+# Pi Zero setup; add TESLA_EMAIL and BLE_RELAY_HOST for the charger container.
+EnvironmentFile=/opt/tesla-solar-control/pi-zero-ble-relay/config.env
+
+ExecStartPre=/bin/bash /opt/tesla-solar-control/preflight.sh
+ExecStartPre=-/usr/bin/podman rm -f solar-charger
+
+ExecStart=/usr/bin/podman run --name solar-charger \
+  --privileged \
+  --net=host \
+  -e SOLAR_API_BASE=http://127.0.0.1 \
+  -e TESLA_VIN=${TESLA_VIN} \
+  -e TESLA_EMAIL=${TESLA_EMAIL} \
+  -e BLE_RELAY_HOST=${BLE_RELAY_HOST} \
+  -e BLE_RELAY_API_KEY=${API_KEY} \
+  --rm \
+  -v /var/run/dbus:/var/run/dbus:ro \
+  -v /opt/tesla-solar-control/private.pem:/app/private.pem:ro \
+  -v /opt/tesla-solar-control/cache.json:/app/cache.json \
+  -v /usr/local/bin/tesla-control:/usr/local/bin/tesla-control:ro \
+  localhost/tesla-solar-control:latest
+
+ExecStop=/usr/bin/podman stop -t 30 solar-charger
+
+[Install]
+WantedBy=multi-user.target
