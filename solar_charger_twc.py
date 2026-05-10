@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 ================================================================================
+Solar Charger TWC Fork - v4.0.28-twc - Corrective BLE re-issue on twc << cmd drift (MANUAL/CALENDAR/SOLAR)
+Solar Charger TWC Fork - v4.0.27-twc - SOLAR-mode tightening: median-based decisions + 4 new gates
 Solar Charger TWC Fork - v4.0.26-twc - Telemetry-only: per-loop voltage_v from envoy SSE (no decision changes)
 Solar Charger TWC Fork - v4.0.25-twc - Telemetry-only: per-loop TWC actual amps + ble_amp_age (no decision changes)
 Solar Charger TWC Fork - v4.0.24-twc - Truthful current_amps seed on session start (no-sun replug throttle-down)
@@ -31,6 +33,50 @@ Based on: Solar Charger v4.0.10
 ================================================================================
 HISTORICAL CHANGELOG (PRESERVED VERBATIM)
 ================================================================================
+
+v4.0.28-twc - Corrective BLE re-issue on persistent twc << cmd drift
+- BUG FIX: Three mode blocks (MANUAL line ~1549, CALENDAR line ~1783, SOLAR
+  line ~2225) silently exited when state.current_amps == target without
+  verifying the car physically followed. Live-confirmed 2026-05-10: car
+  drew 6.1A from grid for 2+ hours while state.current_amps=48 and
+  ~9.7kW solar exported. Direct curl of the BLE relay proved the car
+  would have accepted the corrective command in 2.09s — the bug was
+  purely in the believed-state==reality assumption.
+- ROOT CAUSE: v4.0.24 disconnect-normalize seeding (state.current_amps =
+  MAX_AMPS on session start when prior disconnect-edge succeeded) lied
+  on plug cycles where the car came up at a lower amp setting (Tesla
+  app's last-set memory or external override). Each block's
+  current_amps==target check then treated it as "we're done."
+- FIX: New helper `needs_corrective_reissue(twc_actual, target_amps,
+  precond_active, complete_at_target)` returns True when twc_actual is
+  > TWC_TRACKING_TOLERANCE_A below target for DRIFT_CORRECTION_LOOPS
+  consecutive loops, given a fresh TWC reading and ble_amp_age >
+  DRIFT_CORRECTION_MIN_BLE_AGE_S (don't fight a fresh BLE that's still
+  settling). Applied in MANUAL/CALENDAR/SOLAR's silent-exit branches.
+  Each block calls set_charging_amps(target) and resets
+  state.drift_loop_count = 0 on success.
+- NEW STATE FIELD: ChargerState.drift_loop_count (int). Maintained by
+  needs_corrective_reissue: increments each drifted loop, resets when
+  twc within tolerance OR precond/complete-at-target gate.
+- NEW CONSTANTS: DRIFT_CORRECTION_LOOPS (3), DRIFT_CORRECTION_MIN_BLE_AGE_S
+  (60). Recovery time for the May 10 scenario: ~90s.
+- NOT TOUCHED: EMERGENCY at line ~1681 has its own inline equivalent
+  (different threshold, safety-critical battery <50% block) — left
+  alone to minimize regression surface. Stale-Envoy failsafe at line
+  ~2056 has the same pattern but only fires when Envoy is >10min stale
+  — declined to fix (low blast radius, would add complexity to a
+  rare-path).
+- INVARIANTS PRESERVED: Wife-Tesla-app guard (line 2191:
+  current_amps==0 + non-positive excess) is untouched — corrective
+  re-issue doesn't change current_amps. v4.0.24 disconnect-normalize
+  seeding logic untouched. v4.0.27 TWC tracking gate (UP-only) does
+  not conflict — it only fires when banded_target > current_amps,
+  while corrective re-issue fires only when banded_target ==
+  current_amps. Preconditioning + complete-at-target gates honored.
+  BLE cooldown/backoff respected via standard ble_allowed() check.
+- ROLLBACK: git revert <commit> && sudo podman build -t
+  localhost/tesla-solar-control:latest . && sudo systemctl restart
+  solar-charger.
 
 v4.0.27-twc - SOLAR-mode tightening: median-based decisions + 4 new gates
 - FEATURE: SOLAR steady-state amp targeting now uses excess_median (60s 1Hz
@@ -343,7 +389,7 @@ Solar Charger - BLE Edition v3.6.6 / v3.6.5 / v3.6.4
 ================================================================================
 """
 
-VERSION = "v4.0.27-twc"
+VERSION = "v4.0.28-twc"
 
 import time
 import subprocess
@@ -437,6 +483,15 @@ SSE_FRESH_THRESHOLD_S = 15       # consecutive samples below this rebuild ramp a
 SSE_FRESH_RECOVERY_LOOPS = 2     # fresh loops required before resuming UP steps
 TWC_TRACKING_TOLERANCE_A = 4     # twc must be within this of cmd to ramp UP
 
+# v4.0.28: corrective re-issue when believed state (state.current_amps)
+# disagrees with measured reality (twc_actual). Fixes the May 10 2026
+# silent-skip class in MANUAL/CALENDAR/SOLAR where `current_amps == target`
+# was treated as "we're done" without verifying the car actually followed.
+# EMERGENCY (line ~1681) has its own inline equivalent — left untouched.
+# See feedback_believed_state_vs_reality.md.
+DRIFT_CORRECTION_LOOPS = 3              # consecutive drifted loops before re-issue
+DRIFT_CORRECTION_MIN_BLE_AGE_S = 60     # don't fight a fresh BLE still settling
+
 BLE_COOLDOWN = 12
 BLE_BACKOFF_INITIAL = 60
 BLE_MAX_BACKOFF = 3600
@@ -497,6 +552,11 @@ class ChargerState:
     # >= SSE_FRESH_RECOVERY_LOOPS to prevent greedy ramp on a single fresh
     # sample after a stale window (May 4 2026 14:14:59 phantom +11kW event).
     fresh_recovery_count: int = 0
+
+    # v4.0.28: counts consecutive loops where twc_actual is significantly
+    # below state.current_amps. Triggers a corrective BLE re-issue from
+    # MANUAL/CALENDAR/SOLAR after DRIFT_CORRECTION_LOOPS.
+    drift_loop_count: int = 0
 
     # Charge limit cache - avoid redundant BLE calls
     last_charge_limit_set: Optional[int] = None
@@ -1233,6 +1293,36 @@ def start_charging():
     return False
 
 
+def needs_corrective_reissue(twc_actual, target_amps,
+                              precond_active=False,
+                              complete_at_target=False):
+    """Return True when state.current_amps believes we're at target_amps but
+    twc_actual says we're significantly below for DRIFT_CORRECTION_LOOPS
+    consecutive loops. Fixes the May 10 2026 silent-skip class.
+
+    Side effect: maintains state.drift_loop_count. Caller should call
+    set_charging_amps(target_amps) when this returns True and reset
+    state.drift_loop_count = 0 on a successful re-issue.
+
+    EMERGENCY at line ~1681 has its own inline version (different threshold,
+    safety-critical block) — intentionally not consolidated here.
+    """
+    if precond_active or complete_at_target:
+        state.drift_loop_count = 0
+        return False
+    if twc_actual is None:
+        return False
+    if state.last_ble_amp_command_t == 0:
+        return False  # No amp BLE this process lifetime — nothing to verify
+    if (time.time() - state.last_ble_amp_command_t) < DRIFT_CORRECTION_MIN_BLE_AGE_S:
+        return False  # Recent BLE may still be physically settling
+    if twc_actual + TWC_TRACKING_TOLERANCE_A >= target_amps:
+        state.drift_loop_count = 0
+        return False
+    state.drift_loop_count += 1
+    return state.drift_loop_count >= DRIFT_CORRECTION_LOOPS
+
+
 def stop_charging():
     """Stop charging via BLE. Updates cached state to prevent spam."""
     if ble_call('charging-stop'):
@@ -1551,7 +1641,19 @@ def main():
             elif charging_state != 'Charging' and ble_allowed():
                 ble_succeeded = start_charging()
             else:
-                ble_succeeded = True
+                # v4.0.28: corrective re-issue when twc has drifted below cmd.
+                # Without this, MANUAL silently exits when current_amps==MAX_AMPS
+                # even if the car is physically only drawing 6A (May 10 2026).
+                twc_check = get_twc_current_amps()
+                if needs_corrective_reissue(twc_check, MAX_AMPS):
+                    log(f"⚡ MANUAL: corrective BLE — twc={twc_check:.1f}A vs "
+                        f"cmd={state.current_amps}A "
+                        f"({state.drift_loop_count} loops drifted)")
+                    ble_succeeded = set_charging_amps(MAX_AMPS)
+                    if ble_succeeded:
+                        state.drift_loop_count = 0
+                else:
+                    ble_succeeded = True
 
             if ble_succeeded:
                 state.manual_ble_fails = 0
@@ -1790,6 +1892,20 @@ def main():
                             start_charging()
                         else:
                             log("CALENDAR: need to start charging but BLE gated; will retry next loop")
+                    else:
+                        # v4.0.28: corrective re-issue when twc has drifted
+                        # below cmd. Same silent-skip class as MANUAL — would
+                        # have grid-charged a wife-trip CALENDAR session.
+                        twc_check = get_twc_current_amps()
+                        if needs_corrective_reissue(twc_check, MAX_AMPS):
+                            if ble_allowed():
+                                log(f"⚡ CALENDAR: corrective BLE — twc={twc_check:.1f}A vs "
+                                    f"cmd={state.current_amps}A "
+                                    f"({state.drift_loop_count} loops drifted)")
+                                if set_charging_amps(MAX_AMPS):
+                                    state.drift_loop_count = 0
+                            else:
+                                log("CALENDAR: corrective BLE needed but gated; will retry next loop")
 
                     # Wake escalation (same pattern as MANUAL mode)
                     ble_succeeded = state.ble_command_this_loop and state.ble_fail_count == 0
@@ -2223,6 +2339,23 @@ def main():
                             set_charge_limit(DEFAULT_BATTERY_TARGET)
             else:
                 log(f"Stable at {state.current_amps}A, target {banded_target}A within threshold")
+                # v4.0.28: corrective re-issue when twc has drifted below cmd.
+                # Without this, SOLAR silently exits when banded_target ==
+                # current_amps even if the car physically dropped to 6A
+                # (May 10 2026 — seeded current_amps=48 from disconnect
+                # normalize, but car came up at 6A on the new plug cycle).
+                solar_precond = state.cached_is_preconditioning or is_precondition_inhibit_active(dashboard_config)
+                if needs_corrective_reissue(twc_actual, state.current_amps,
+                                             precond_active=solar_precond,
+                                             complete_at_target=car_complete_at_target):
+                    if ble_allowed():
+                        log(f"⚡ SOLAR: corrective BLE — twc={twc_actual:.1f}A vs "
+                            f"cmd={state.current_amps}A "
+                            f"({state.drift_loop_count} loops drifted)")
+                        if set_charging_amps(state.current_amps):
+                            state.drift_loop_count = 0
+                    else:
+                        log("SOLAR: corrective BLE needed but gated; will retry next loop")
         else:
             log(
                 f"Building stability: {len(state.amp_target_history)}/"
