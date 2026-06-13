@@ -8,7 +8,7 @@ Controls Tesla charging based on solar excess. Runs on a Raspberry Pi 5 in a Pod
 - Uses `tesla-control` over BLE through a Pi Zero relay — lower latency than the Tesla API, avoids waking the car unnecessarily, and the relay can be positioned independently for better range.
 - Detects home/away via Tesla Wall Connector plug state. No GPS geofencing.
 - Reads Google Calendar for upcoming trips. An AI assessment estimates round-trip distance and recommends a battery target (50–95%); timing is calculated from departure minus estimated charge time so it doesn't start charging 24 hours early.
-- Trips targeting above 80% pause at 80% for dashboard approval. Auto-approves if departure is under 2 hours out.
+- Trips targeting above 80% pause at 80% and wait for explicit dashboard approval (manual only).
 - When battery drops below 50%, charges at full speed (48A) regardless of solar. Continues past the 90-minute fallback if battery is still rising.
 - Stops charging when solar drops below 100W for 10 minutes. Resumes at sunrise.
 - After 3 consecutive BLE failures, escalates to a Tesla API wake. Each mode tracks its own cooldown separately.
@@ -170,6 +170,14 @@ See `pi-zero-ble-relay/` for relay setup.
 
 | Version | Highlights |
 |---------|-----------|
+| **v4.0.35-twc** | Post-wake confirmation polls up to 30s for `AWAKE` (a deep-sleep BLE wake was measured at ~9s; the old single 5s check mislabeled real wakes as failures) |
+| **v4.0.34-twc** | BLE-first vehicle status + wake after Tesla disabled the legacy owner-api: battery/charge/climate via `tesla-control state`, vcsec `wake` gated by `body-controller-state`; relay HCI lock; charge limit reconciled from the car's actual `chargeLimitSoc` |
+| **v4.0.33-twc** | SOLAR-PAUSE release no longer vetoed by chronic SSE staleness |
+| **v4.0.32-twc** | `MAX_AMP_STEP` 4→6; SOLAR-PAUSE: BLE stop when pinned at the 6A floor with sustained deep grid import |
+| **v4.0.31-twc** | NIGHT external-charge discriminator (respect a user-started charge after a confirmed stop) + TWC-latency debounce |
+| **v4.0.30-twc** | NIGHT stop decides on live TWC current, not cached state (fixes a "complete at 0A" stop that ran the car to 80% overnight) |
+| **v4.0.29-twc** | Seasonal per-month cold-start excess threshold gating 0A→6A SOLAR initiation |
+| **v4.0.28-twc** | Corrective BLE re-issue on persistent `twc << cmd` drift (MANUAL/CALENDAR/SOLAR) |
 | **v4.0.27-twc** | SOLAR tightening: 1Hz median for steady-state targets, fast-drop on import spike + smooth excess cliff, TWC tracking gate on upward steps, SSE stale hold/recovery, voltage-based amp divisor when telemetry present |
 | **v4.0.26-twc** | Per-loop grid voltage from Envoy SSE → dashboard → telemetry (`volt=` on Charge line) |
 | **v4.0.25-twc** | Telemetry: TWC actual amps, BLE amp command age, `last_ble_amp_command_t` |

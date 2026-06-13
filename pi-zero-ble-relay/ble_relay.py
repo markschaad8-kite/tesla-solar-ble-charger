@@ -8,10 +8,15 @@ Exposes a simple HTTP API that executes tesla-control commands.
 
 import os
 import subprocess
+import threading
 import time
 import json
 from datetime import datetime
 from flask import Flask, request, jsonify
+
+# Two concurrent tesla-control processes collide on hci0 and fail instantly
+# ("can't down device: device or resource busy"). Serialize all BLE access.
+HCI_LOCK = threading.Lock()
 
 # =============================================================================
 # Configuration
@@ -84,12 +89,13 @@ def run_tesla_control(command, args=None, domain='infotainment'):
     start_time = time.time()
 
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=BLE_TIMEOUT
-        )
+        with HCI_LOCK:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=BLE_TIMEOUT
+            )
         duration = time.time() - start_time
         output = (result.stdout + result.stderr).strip()
         success = result.returncode == 0
@@ -226,8 +232,8 @@ def ble_wake():
 
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Wake request received")
 
-    # Try a simple BLE command that might wake the car
-    success, output, duration = run_tesla_control('ping')
+    # Real VCSEC wake (works while infotainment is asleep)
+    success, output, duration = run_tesla_control('wake', domain='vcsec')
 
     return jsonify({
         'success': success,

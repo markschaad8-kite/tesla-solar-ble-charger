@@ -36,7 +36,7 @@ MAX_AMPS = 48
 VOLTAGE = 240
 AMP_STABILITY_BAND = 2
 AMP_CHANGE_THRESHOLD = 2
-MAX_AMP_STEP = 4
+MAX_AMP_STEP = 6  # v4.0.32: raised from 4 (export-underuse fix; keep in sync with live)
 
 FAST_DROP_IMPORT_W = 3000
 SSE_STALE_THRESHOLD_S = 30

@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
 ================================================================================
+Solar Charger TWC Fork - v4.0.33-twc - SOLAR-PAUSE release no longer vetoed by chronic SSE staleness: after 4 consecutive above-threshold loops (~2 min) the pause releases even while sse_stale (post-stale UP-step gate still prevents BLE on stale data). Code-review finding from 2026-06-09 deploy night (42s envoy lag observed at dusk)
+Solar Charger TWC Fork - v4.0.32-twc - Loss-bucket fixes: MAX_AMP_STEP 4->6 (export-underuse, bucket 2) + SOLAR-PAUSE on deep sustained floor import (bucket 1, option b): BLE stop when pinned at 6A with median import >= 1500W for ~15min; resume via seasonal cold-start gate; NIGHT-style confirmed-stop discriminator respects user-initiated charges
+Solar Charger TWC Fork - v4.0.31-twc - NIGHT discriminator: respect a user-initiated charge that starts AFTER a confirmed stop (the Tesla app), keep retrying a stop that never confirmed. Hardened vs TWC latency: confirmed needs 2 consecutive TWC<=0.5 reads (debounce), and get_twc_current_amps returns None on a missing field (unknown != 0)
+Solar Charger TWC Fork - v4.0.30-twc - NIGHT stops on live TWC current (not cached 0A) + re-assert control on MANUAL->SOLAR switch
+Solar Charger TWC Fork - v4.0.29-twc - Seasonal cold-start excess threshold (month-based map)
 Solar Charger TWC Fork - v4.0.28-twc - Corrective BLE re-issue on twc << cmd drift (MANUAL/CALENDAR/SOLAR)
 Solar Charger TWC Fork - v4.0.27-twc - SOLAR-mode tightening: median-based decisions + 4 new gates
 Solar Charger TWC Fork - v4.0.26-twc - Telemetry-only: per-loop voltage_v from envoy SSE (no decision changes)
@@ -33,6 +38,35 @@ Based on: Solar Charger v4.0.10
 ================================================================================
 HISTORICAL CHANGELOG (PRESERVED VERBATIM)
 ================================================================================
+
+v4.0.29-twc - Seasonal cold-start excess threshold (month-based map)
+- FEATURE: SOLAR cold-start from 0A is now gated by a per-month excess
+  threshold (SOLAR_START_EXCESS_BY_MONTH). Replaces the binary
+  `decision_excess <= 0` Tesla-app guard with `decision_excess <
+  start_threshold`. Summer (Jun-Aug: 1400W) ensures the 6A floor
+  (1440W @ 240V) is fully solar-covered before initiating, so no
+  grid-pull on cold-starts during long sunny days. Winter (Nov-Feb:
+  200-400W) is permissive — on weak-solar days you still want any
+  positive excess to start charging because hitting 1.4kW net excess
+  is rare.
+- ALSO GATED: Complete-below-target restart at the SOLAR-block tail
+  (when state.last_charge_limit_set >= 80% and battery < 80% and car
+  shows Complete). Same threshold prevents pointless mid-day BLE wakes
+  when excess is too low to charge meaningfully.
+- INVARIANTS PRESERVED: Wife-Tesla-app TWC sync logic (lines 2308-2319)
+  unchanged — runs whenever excess < threshold and current_amps == 0.
+  Once charging is running (current_amps > 0), the existing
+  ramp/hysteresis/fast-drop/median logic is untouched — the car can
+  ramp down to MIN_AMPS on cloud cover and continue charging even with
+  excess below the cold-start threshold. v4.0.27 TWC tracking gate,
+  v4.0.28 corrective re-issue, calendar/emergency/manual paths all
+  unaffected.
+- TUNING: Map values are starting estimates for ~43°N (temperate northern US).
+  Watch May 14+ daily stats to see how often summer cold-starts get
+  gated vs. fire — adjust Jun-Aug downward if too conservative.
+- ROLLBACK: git revert <commit> && sudo podman build -t
+  localhost/tesla-solar-control:latest . && sudo systemctl restart
+  solar-charger.
 
 v4.0.28-twc - Corrective BLE re-issue on persistent twc << cmd drift
 - BUG FIX: Three mode blocks (MANUAL line ~1549, CALENDAR line ~1783, SOLAR
@@ -389,12 +423,13 @@ Solar Charger - BLE Edition v3.6.6 / v3.6.5 / v3.6.4
 ================================================================================
 """
 
-VERSION = "v4.0.28-twc"
+VERSION = "v4.0.35-twc"
 
 import time
 import subprocess
 import requests
 import os
+import json
 import threading
 from datetime import datetime
 from collections import deque
@@ -415,7 +450,7 @@ TESLA_EMAIL = os.getenv("TESLA_EMAIL", "")
 # -------------------------------
 SOLAR_API_BASE = os.getenv(
     "SOLAR_API_BASE",
-    "http://localhost"  # Dashboard + TWC API base (--net=host => host localhost)
+    "http://localhost"  # All services on the same host
 )
 
 PI2_SOLAR_URL = f"{SOLAR_API_BASE}:8080/api/envoy_data"
@@ -469,9 +504,20 @@ CACHE_TTL = 600
 AMP_CHANGE_THRESHOLD = 2
 AMP_STABILITY_COUNT = 1
 AMP_STABILITY_BAND = 2
-MAX_AMP_STEP = 4  # Max amp increase per loop (Envoy updates every 60s, loop is 30s)
+# v4.0.32: raised 4 -> 6. The +4A cap was chosen when Envoy data updated every
+# 60s; with the v4.0.27 1Hz-median basis the up-signal is trustworthy enough
+# for a bigger step. Counterfactual sim on May 16-Jun 8 CSVs (sim_v4_0_32.py):
+# export-underuse 30.6 -> 26.9 kWh (-12%) for +1.2 kWh overshoot import, with
+# a slightly LOWER BLE count (fewer ramp loops). Step 8 bought only ~1.7 kWh
+# more export capture for nearly double the import penalty — 6 is the balance.
+MAX_AMP_STEP = 6  # Max amp increase per loop (1Hz median basis; was 4 pre-v4.0.32)
 SMOOTH_WINDOW = 3
 SUSTAINED_NIGHT_SEC = 600
+# v4.0.31: consecutive TWC<=0.5 reads required before NIGHT latches
+# night_stop_confirmed. Debounces a single transient/missing-field zero (TWC
+# lags the car ~10s; loop is 30s) so we don't mislabel an actually-charging car
+# as idle and then leave a real charge running on the grid.
+NIGHT_CONFIRM_LOOPS = 2
 
 # v4.0.27: SOLAR-mode decisions now use the 1Hz buffer signals (median for
 # steady-state, excess_smooth for cliff detection) plus three gates layered
@@ -482,6 +528,48 @@ SSE_STALE_THRESHOLD_S = 30       # envoy_age_max above this -> hold both directi
 SSE_FRESH_THRESHOLD_S = 15       # consecutive samples below this rebuild ramp authority
 SSE_FRESH_RECOVERY_LOOPS = 2     # fresh loops required before resuming UP steps
 TWC_TRACKING_TOLERANCE_A = 4     # twc must be within this of cmd to ramp UP
+
+# Seasonal cold-start excess threshold. SOLAR mode won't initiate charging
+# from 0A (or restart a Complete-below-target session) until decision_excess
+# crosses the current month's value. Once charging is running, the normal
+# ramp/hysteresis logic governs — this gate only fires on 0A → first-amps.
+# Summer values cover the full 6A floor (1440W) with margin so cold-starts
+# pull no grid; winter values are low to allow opportunistic charging on
+# weak-solar days where reaching 1440W net excess is rare.
+SOLAR_START_EXCESS_BY_MONTH = {
+    1: 200,  2: 300,  3: 500,  4: 800,
+    5: 1200, 6: 1400, 7: 1400, 8: 1400,
+    9: 1200, 10: 800, 11: 400, 12: 200,
+}
+
+def get_solar_start_threshold():
+    return SOLAR_START_EXCESS_BY_MONTH[datetime.now().month]
+
+# v4.0.32: SOLAR-PAUSE on deep sustained floor import (loss-bucket analysis
+# 2026-06-03: floor-import was 57.6 kWh over 18 days vs 8.0 kWh for the
+# chase/overshoot the plan originally targeted). Option (b) per Mark: pause
+# ONLY deep sustained imports — mild top-ups (e.g. -300W) keep charging.
+# When SOLAR has the car pinned at the 6A floor (state.current_amps ==
+# MIN_AMPS — OUR command; external charges have current_amps==0 so the
+# Tesla-app guard is untouched) and the 1Hz median shows import beyond
+# SOLAR_PAUSE_IMPORT_W for SOLAR_PAUSE_SUSTAIN_LOOPS consecutive fresh loops,
+# send a BLE stop. Resume rides the existing seasonal cold-start gate
+# (June: +1400W stopped-basis excess) — wide natural hysteresis, no new
+# resume machinery. Threshold choice: 1500W ~= the car's entire 6A draw
+# (6A x 246V x 2 phases ~ 1480W) coming from grid, i.e. production is below
+# the house load alone. Sim sweep May 16-Jun 8 (sim_v4_0_32.py): 1500W =
+# 13 pauses / 19.5 kWh import saved / 1 same-day flap; 1200W bought only
+# +2.3 kWh more for 5x the flap count.
+SOLAR_PAUSE_IMPORT_W = 1500       # median import beyond this = "deep"
+SOLAR_PAUSE_SUSTAIN_LOOPS = 30    # ~15 min at 30s loop; SSE-stale loops freeze (not reset) the streak
+# v4.0.33: release is not vetoed indefinitely by SSE staleness. A chronically
+# lagging Envoy SSE (observed 42s at dusk 2026-06-09) would otherwise hold a
+# paused car off on a sunny morning. After this many consecutive loops with
+# decision_excess >= the seasonal threshold, release even while sse_stale —
+# safe because the post-stale recovery gate still blocks UP-steps until 2
+# fresh loops, so no BLE fires on stale data; release just returns control
+# to the normal flow. (2026-06-09 code-review finding #1.)
+SOLAR_PAUSE_STALE_RELEASE_LOOPS = 4   # ~2 min sustained above-threshold
 
 # v4.0.28: corrective re-issue when believed state (state.current_amps)
 # disagrees with measured reality (twc_actual). Fixes the May 10 2026
@@ -500,6 +588,13 @@ RELAY_UNREACHABLE_ALERT_THRESHOLD = 3
 # Wake escalation (MANUAL mode only)
 WAKE_COOLDOWN_SEC = 900       # 15 minutes
 BLE_FAILS_BEFORE_WAKE = 3
+# Post-wake confirmation poll (v4.0.35): a vcsec wake from deep sleep was measured
+# at ~9s live (2026-06-13), so a single 5s check mislabels real wakes as failures
+# and trips the cloud fallback + cooldown. Poll up to ~30s instead, returning as
+# soon as the car reports AWAKE. Shorter than the tire monitor's 80s because this
+# is a 30s real-time control loop (a sleeping car has nothing to charge anyway).
+WAKE_CONFIRM_POLLS = 6        # number of AWAKE checks after sending wake
+WAKE_CONFIRM_DELAY = 5        # seconds between checks (6 x 5s = up to 30s)
 
 # Hybrid emergency fallback runtime
 MAX_EMERGENCY_RUNTIME = 90 * 60  # 90 minutes
@@ -523,6 +618,7 @@ class ChargerState:
     cached_vehicle_online: bool = True
     cached_ts: float = 0.0
     last_status_check: float = 0.0
+    last_status_attempt: float = 0.0  # v4.0.34: throttles BLE status attempts (incl. failures)
 
     amp_target_history: Deque[int] = field(default_factory=lambda: deque(maxlen=AMP_STABILITY_COUNT))
     production_window: Deque[float] = field(default_factory=lambda: deque(maxlen=SMOOTH_WINDOW))
@@ -530,6 +626,29 @@ class ChargerState:
 
     last_low_prod_time: Optional[float] = None
     night_stop_sent: bool = False
+    # v4.0.31: True once, during the current night-stop episode, we have observed
+    # TWC current actually reach ~0 (i.e. a stop genuinely took). Discriminates
+    # "our stop silently failed" (confirmed==False, keep retrying) from "a NEW
+    # external charge started after we already stopped" (confirmed==True, e.g.
+    # the Tesla-app 'charge now' — respect it, don't fight). Reset to False
+    # whenever the night-stop episode ends. See [[project_tesla_app_workflow]].
+    night_stop_confirmed: bool = False
+    # v4.0.31: consecutive TWC<=0.5 reads observed this episode. Latches
+    # night_stop_confirmed once it reaches NIGHT_CONFIRM_LOOPS. Reset to 0 on any
+    # current-flowing / unknown read and at every episode boundary.
+    night_zero_streak: int = 0
+    # v4.0.32 SOLAR-PAUSE state. Mirrors the NIGHT stop machinery (confirmed
+    # discriminator + zero-streak debounce) for the deep-floor-import pause.
+    # import_streak counts consecutive fresh loops at the 6A floor with median
+    # import >= SOLAR_PAUSE_IMPORT_W (frozen, not reset, on SSE-stale loops).
+    solar_pause_import_streak: int = 0
+    solar_pause_active: bool = False
+    solar_pause_stop_confirmed: bool = False
+    solar_pause_zero_streak: int = 0
+    # v4.0.33: consecutive paused loops with decision_excess >= seasonal
+    # threshold. Releases the pause despite sse_stale once it reaches
+    # SOLAR_PAUSE_STALE_RELEASE_LOOPS (staleness delays resume, never vetoes).
+    solar_pause_release_streak: int = 0
     last_manual_state: bool = False
     last_calendar_mode: bool = False
     calendar_reason: Optional[str] = None
@@ -598,7 +717,7 @@ class ChargerState:
     # set the car to MAX_AMPS via BLE. Consumed on the next session-start
     # to seed state.current_amps = MAX_AMPS instead of zeroing it, so SOLAR
     # can throttle down a no-sun replug. If false at session-start (e.g.
-    # disconnect-edge BLE failed, or wife started a charge via Tesla app
+    # disconnect-edge BLE failed, or a charge was started via the Tesla app
     # without us seeing a session edge), current_amps stays 0 and the
     # line ~1914 "external charge" guard respects the user's intent.
     disconnect_normalize_amps_succeeded: bool = False
@@ -607,6 +726,15 @@ class ChargerState:
     grid_charge_warning_amps: Optional[float] = None
     relay_unreachable_streak: int = 0
     relay_unreachable_alert: bool = False
+
+    # --- v4.0.30: Re-assert control on a deliberate mode switch ---
+    # Set true when the user switches the dashboard mode MANUAL->SOLAR. A
+    # deliberate mode change is a control hand-off, not a passive observation:
+    # the next active mode (EMERGENCY/SOLAR) must re-issue its commands for real
+    # instead of trusting cached beliefs that may be stale (e.g. a set-limit the
+    # relay actually FAILED but ble_call recorded as success). Consumed by the
+    # takeover block at the top of the next loop. See May 22 2026 incident.
+    force_reassert: bool = False
 
 state = ChargerState()
 
@@ -793,10 +921,23 @@ def reset_away_mode_state():
     """Reset state flags when entering AWAY mode or safe-default fallback.
     Used on: TWC disconnected, TWC unreachable with no/disconnected cache."""
     state.night_stop_sent = False
+    state.night_stop_confirmed = False
+    state.night_zero_streak = 0
+    reset_solar_pause_state()
     state.manual_ble_fails = 0
     state.ble_fail_count = 0
     state.emergency_start_ts = None
     state.emergency_start_battery = None
+
+
+def reset_solar_pause_state():
+    """v4.0.32: clear the SOLAR-PAUSE episode. Called on disconnect/AWAY
+    (episode is physically over) and on pause release."""
+    state.solar_pause_import_streak = 0
+    state.solar_pause_active = False
+    state.solar_pause_stop_confirmed = False
+    state.solar_pause_zero_streak = 0
+    state.solar_pause_release_streak = 0
 
 
 def reset_session_state():
@@ -807,6 +948,7 @@ def reset_session_state():
     state.ble_fail_count = 0
     state.ble_backoff_until = 0.0
     state.emergency_start_ts = None
+    reset_solar_pause_state()
 
 
 # -------------------------------
@@ -849,12 +991,22 @@ def get_twc_connected_safe():
 
 
 def get_twc_current_amps():
-    """Get actual current amps from TWC monitor. Returns None if unavailable."""
+    """Get actual current amps from TWC monitor. Returns None if unavailable.
+
+    v4.0.31: a MISSING `vehicle_current_a` field returns None ("unknown"), not
+    0.0. Defaulting to 0.0 made a partial/malformed TWC response look like "no
+    current" — which the NIGHT discriminator would latch as a confirmed stop and
+    then leave a real charge running on the grid. Unknown != zero.
+    """
     try:
         r = requests.get(TWC_STATUS_URL, timeout=2.0)
         r.raise_for_status()
         j = r.json()
-        return float(j.get('vehicle_current_a', 0))
+        val = j.get('vehicle_current_a')
+        if val is None:
+            log("Warning: TWC status missing vehicle_current_a -> treating as unknown")
+            return None
+        return float(val)
     except Exception as e:
         log(f"Warning: Could not get TWC amps: {e}")
         return None
@@ -960,14 +1112,156 @@ def update_dashboard_status(mode, amps, target_amps, battery, excess_watts, prod
 # -------------------------------
 # Tesla status (cached + TTL)
 # -------------------------------
+STATUS_ATTEMPT_MIN_SEC = 55  # min spacing between BLE status attempts, incl. failed ones
+                             # (55 < EMERGENCY_STATUS_INTERVAL=60 so emergency cadence is unaffected)
+
+
+def ble_relay_raw(command, args=None, domain='infotainment', timeout=50):
+    """
+    Send a tesla-control command via the Pi Zero relay, returning
+    (success, RAW case-preserved output). State reads parse JSON, so this must
+    not go through run_tesla_control_via_relay(), which lowercases output.
+    Deliberately bypasses ble_call() gating: status reads are passive and the
+    relay's HCI lock serializes them against charging commands.
+    """
+    if args is None:
+        args = []
+    if not BLE_RELAY_ENABLED:
+        local = ["tesla-control", "-domain", domain, "-ble", "-vin", VIN,
+                 "-key-file", KEY_FILE, command] + [str(a) for a in args]
+        try:
+            r = subprocess.run(local, capture_output=True, text=True, timeout=timeout)
+            return r.returncode == 0, (r.stdout + r.stderr).strip()
+        except Exception as e:
+            return False, str(e)
+    try:
+        headers = {}
+        if BLE_RELAY_API_KEY:
+            headers['X-API-Key'] = BLE_RELAY_API_KEY
+        resp = requests.post(
+            f"{BLE_RELAY_URL}/ble/command",
+            json={'command': command, 'args': [str(a) for a in args], 'domain': domain},
+            headers=headers,
+            timeout=timeout,
+        )
+        data = resp.json()
+        return data.get('success', False), data.get('output', '')
+    except Exception as e:
+        return False, f"relay error: {e}"
+
+
+def ble_state_read(category):
+    """Fetch one `tesla-control state <category>` as a parsed dict, or None."""
+    ok, out = ble_relay_raw('state', [category])
+    if not ok:
+        log(f"BLE state {category}: FAILED ({out[:80]})")
+        return None
+    try:
+        return json.loads(out)
+    except ValueError:
+        log(f"BLE state {category}: unparseable output ({out[:80]})")
+        return None
+
+
+def get_vehicle_sleep_status():
+    """
+    VCSEC body-controller-state — works while the car sleeps, without waking it.
+    Returns 'AWAKE', 'ASLEEP', or None (relay/BLE failure or unknown value).
+    """
+    ok, out = ble_relay_raw('body-controller-state', [], domain='vcsec')
+    if not ok:
+        return None
+    try:
+        status = json.loads(out).get('vehicleSleepStatus', '')
+    except ValueError:
+        return None
+    if 'AWAKE' in status:
+        return 'AWAKE'
+    if 'ASLEEP' in status:
+        return 'ASLEEP'
+    return None
+
+
 def get_tesla_status():
     """
     Get Tesla vehicle status. TWC fork version - returns (battery, charging_state) only.
     No GPS/is_home - TWC connection is authoritative for home detection.
+
+    v4.0.34: BLE-first via Pi Zero relay (Tesla 403'd owner-api on 2026-06-12).
+    Sleep-gated: a VCSEC body-controller-state read (safe while asleep) decides
+    whether the infotainment `state charge` read is attempted, so status polling
+    never wakes a sleeping car. Cloud owner-api kept as standby fallback.
     """
     now = time.time()
     if (now - state.cached_ts) < CACHE_TTL:
         return state.cached_battery, state.cached_charging_state
+    if (now - state.last_status_attempt) < STATUS_ATTEMPT_MIN_SEC:
+        return state.cached_battery, state.cached_charging_state
+    state.last_status_attempt = now
+
+    sleep_status = get_vehicle_sleep_status()
+    if sleep_status == 'ASLEEP':
+        log("Vehicle asleep (BLE) - using cache")
+        state.cached_vehicle_online = False
+        return state.cached_battery, state.cached_charging_state
+
+    if sleep_status == 'AWAKE':
+        data = ble_state_read('charge')
+        if data:
+            cs = data.get('chargeState', {})
+            battery = cs.get('batteryLevel', state.cached_battery)
+            # Enum renders as {"Complete": {}} today; tolerate a plain string
+            # in case a future firmware/CLI flattens it.
+            charging_raw = cs.get('chargingState')
+            if isinstance(charging_raw, dict):
+                charging = next(iter(charging_raw), state.cached_charging_state)
+            elif isinstance(charging_raw, str) and charging_raw:
+                charging = charging_raw
+            else:
+                charging = state.cached_charging_state
+            measured_limit = cs.get('chargeLimitSoc')
+
+            # Precond only matters while charging (amp-adjust skip); saves a
+            # second BLE round-trip otherwise.
+            is_preconditioning = False
+            if charging == 'Charging':
+                climate = ble_state_read('climate')
+                if climate:
+                    is_preconditioning = bool(
+                        climate.get('climateState', {}).get('isPreconditioning', False))
+                else:
+                    is_preconditioning = state.cached_is_preconditioning
+
+            state.cached_battery = battery
+            state.cached_charging_state = charging
+            state.cached_is_preconditioning = is_preconditioning
+            state.cached_vehicle_online = True
+            state.cached_ts = now
+            state.last_status_check = now
+
+            # Measured charge limit replaces the in-memory belief — survives
+            # container rebuilds and catches app/calendar-set limits we missed.
+            if measured_limit is not None:
+                if state.last_charge_limit_set != measured_limit:
+                    log(f"Charge limit measured at {measured_limit}% "
+                        f"(cache was {state.last_charge_limit_set})")
+                state.last_charge_limit_set = measured_limit
+
+            log(f"Tesla: Battery={battery}%, State={charging}, "
+                f"Precond={is_preconditioning} [BLE]")
+            return battery, charging
+
+    # BLE inconclusive (relay down / read failed) -> legacy cloud fallback
+    return get_tesla_status_cloud(now)
+
+
+def get_tesla_status_cloud(now=None):
+    """
+    Legacy owner-api status read — STANDBY fallback only. Tesla 403'd owner-api
+    on 2026-06-12 (-> fleet-api pointer); kept in case that cutoff is reversed.
+    """
+    if now is None:
+        now = time.time()
     try:
         import teslapy
         with teslapy.Tesla(TESLA_EMAIL, cache_file=CACHE_FILE) as tesla:
@@ -998,7 +1292,7 @@ def get_tesla_status():
             state.cached_ts = now
             state.last_status_check = now
 
-            log(f"Tesla: Battery={battery}%, State={charging}, Precond={is_preconditioning}")
+            log(f"Tesla: Battery={battery}%, State={charging}, Precond={is_preconditioning} [cloud]")
             return battery, charging
     except Exception as e:
         log(f"Tesla status error: {e}")
@@ -1020,9 +1314,12 @@ def _set_wake_cooldown(reason: str, now: float):
 
 def wake_vehicle_safe(reason: str = 'manual'):
     """
-    Wake car via Tesla API with cooldown.
-    Supports separate cooldowns for MANUAL vs SOLAR escalation.
-    Returns True if wake was attempted, False if skipped/failed.
+    Wake car with cooldown. Supports separate cooldowns for MANUAL vs SOLAR
+    escalation. Returns True if wake was attempted, False if skipped/failed.
+
+    v4.0.34: BLE VCSEC wake first (verified via body-controller-state), then
+    legacy owner-api wake as standby fallback — historically the more reliable
+    waker, and it silently regains effect if Tesla reverses the 403 cutoff.
     """
     now = time.time()
 
@@ -1039,6 +1336,26 @@ def wake_vehicle_safe(reason: str = 'manual'):
         log(f"Wake skipped [{reason}] (cooldown {int(remaining)}s remaining)")
         return False
 
+    # --- 1. BLE wake (VCSEC, works while infotainment sleeps) ---
+    log(f"Escalation [{reason}]: sending BLE wake (vcsec)...")
+    ok, out = ble_relay_raw('wake', [], domain='vcsec')
+    if ok:
+        # Poll for AWAKE rather than checking once — measured wake was ~9s, so a
+        # single 5s check would falsely report failure and waste the cloud fallback.
+        for attempt in range(1, WAKE_CONFIRM_POLLS + 1):
+            time.sleep(WAKE_CONFIRM_DELAY)
+            if get_vehicle_sleep_status() == 'AWAKE':
+                _set_wake_cooldown(reason, now)
+                state.last_status_attempt = 0.0  # allow an immediate status read post-wake
+                log(f"BLE wake confirmed [{reason}] (vehicle AWAKE after "
+                    f"{attempt * WAKE_CONFIRM_DELAY}s)")
+                return True
+            log(f"Waiting for wake [{reason}] ({attempt}/{WAKE_CONFIRM_POLLS})...")
+        log("BLE wake sent but vehicle not confirmed awake — trying cloud fallback")
+    else:
+        log(f"BLE wake failed ({out[:80]}) — trying cloud fallback")
+
+    # --- 2. Legacy cloud wake (standby; 403s while owner-api is dark) ---
     try:
         import teslapy
         with teslapy.Tesla(TESLA_EMAIL, cache_file=CACHE_FILE) as tesla:
@@ -1053,6 +1370,7 @@ def wake_vehicle_safe(reason: str = 'manual'):
             vehicle.sync_wake_up()
 
             _set_wake_cooldown(reason, now)
+            state.last_status_attempt = 0.0  # allow an immediate status read post-wake
 
             log("Wake request sent successfully")
             return True
@@ -1460,7 +1778,7 @@ def main():
             # MAX_AMPS via BLE, seed current_amps with that truthful value so
             # SOLAR can throttle down on a no-sun replug. Otherwise zero it,
             # which keeps the line ~1914 "external charge" guard respecting
-            # user-initiated app charges (wife's Tesla app workflow).
+            # user-initiated app charges (the Tesla app workflow).
             if state.disconnect_normalize_amps_succeeded:
                 state.current_amps = MAX_AMPS
                 state.disconnect_normalize_amps_succeeded = False
@@ -1590,13 +1908,31 @@ def main():
         # ========================================
         # 2a) SOLAR TAKEOVER CHECK
         # ========================================
-        # If user requested solar takeover via dashboard button, immediately take control
-        if dashboard_config.get('solar_takeover_requested', False):
-            log("☀️ SOLAR TAKEOVER: User requested solar control via dashboard")
-            # Send BLE command to set minimum amps - this kicks us into control mode
-            if set_charging_amps(MIN_AMPS):
-                log(f"☀️ SOLAR TAKEOVER: Set to {MIN_AMPS}A - script now controlling")
-                clear_solar_takeover()  # Clear the flag
+        # Take control on an explicit user action: the dashboard "Solar Takeover"
+        # button (solar_takeover_requested) OR a deliberate MANUAL->SOLAR mode
+        # switch (state.force_reassert, set when that transition was detected last
+        # loop). Either way we send a real amp BLE command so the script is
+        # actively controlling the car instead of passively riding whatever charge
+        # it was already doing. (May 22 2026: a mode switch alone re-asserted
+        # nothing — EMERGENCY's cached beliefs all matched, so it issued zero BLE
+        # and the car ran to 80% on its own limit.)
+        via_button = dashboard_config.get('solar_takeover_requested', False)
+        if via_button or state.force_reassert:
+            trigger = 'dashboard button' if via_button else 'mode switch to SOLAR'
+            log(f"☀️ SOLAR TAKEOVER: re-asserting control ({trigger})")
+            # Invalidate the cached charge-limit belief so the active mode genuinely
+            # re-issues set_charge_limit() rather than skipping on a stale match.
+            state.last_charge_limit_set = None
+            # In emergency battery range, don't demote to MIN_AMPS — EMERGENCY wants
+            # MAX and will assert it; sending MIN first would briefly throttle an
+            # emergency charge. Otherwise throttle to MIN and let solar ramp up.
+            target = MAX_AMPS if (state.cached_battery is not None
+                                  and state.cached_battery < BATTERY_EMERGENCY) else MIN_AMPS
+            if set_charging_amps(target):
+                log(f"☀️ SOLAR TAKEOVER: Set to {target}A - script now controlling")
+                if via_button:
+                    clear_solar_takeover()  # Clear the dashboard flag
+                state.force_reassert = False
                 state.grid_charge_warning_amps = None  # Clear the warning
             else:
                 log("☀️ SOLAR TAKEOVER: BLE command failed - will retry next loop")
@@ -1611,6 +1947,9 @@ def main():
 
             mode = 'MANUAL'
             state.night_stop_sent = False
+            state.night_stop_confirmed = False
+            # v4.0.32: a deliberate full-power charge ends any pause episode
+            reset_solar_pause_state()
 
             # Reset emergency tracking if manual is activated
             state.emergency_start_ts = None
@@ -1698,6 +2037,13 @@ def main():
                 log("MODE: MANUAL deactivated - returning to SOLAR mode")
                 state.last_manual_state = False
                 state.manual_ble_fails = 0
+                # v4.0.30: a deliberate mode switch is a control hand-off. Force the
+                # next active mode (EMERGENCY/SOLAR) to re-assert for real instead of
+                # trusting cached beliefs. The takeover block at the top of next loop
+                # re-issues amps; clearing the limit cache here makes the active mode
+                # genuinely re-send set_charge_limit() this loop too.
+                state.force_reassert = True
+                state.last_charge_limit_set = None
 
         # =====================================================================
         # 2.5) EMERGENCY OVERRIDE (Correct Priority + Hybrid Exit)
@@ -1712,6 +2058,9 @@ def main():
                 state.emergency_start_ts = time.time()
                 state.emergency_start_battery = battery
                 state.night_stop_sent = False  # Clear night flag so NIGHT doesn't suppress charging
+                state.night_stop_confirmed = False
+                # v4.0.32: a deliberate full-power charge ends any pause episode
+                reset_solar_pause_state()
                 log(f"EMERGENCY: entered at {battery}% (tracking start time)")
 
             elapsed = time.time() - state.emergency_start_ts
@@ -1895,7 +2244,7 @@ def main():
                     else:
                         # v4.0.28: corrective re-issue when twc has drifted
                         # below cmd. Same silent-skip class as MANUAL — would
-                        # have grid-charged a wife-trip CALENDAR session.
+                        # have grid-charged a CALENDAR trip session.
                         twc_check = get_twc_current_amps()
                         if needs_corrective_reissue(twc_check, MAX_AMPS):
                             if ble_allowed():
@@ -1977,6 +2326,9 @@ def main():
         # If we just exited CALENDAR mode, reset for SOLAR charging
         if was_in_calendar and not state.last_calendar_mode:
             state.current_amps = 0  # Force SOLAR to recalculate from scratch
+            # v4.0.32: calendar charge ran at 48A — any pre-calendar pause
+            # episode is stale; clear it so SOLAR re-evaluates fresh.
+            reset_solar_pause_state()
             # v4.0.23: was '< DEFAULT_BATTERY_TARGET' which only handled the
             # case where calendar set a LOWER limit. With above-80 approval
             # (e.g. cal_target=95), the limit needs to be reset DOWN. Use !=
@@ -2099,19 +2451,55 @@ def main():
                 if not state.night_stop_sent:
                     log(f"Night mode: production below {MIN_SOLAR_PRODUCTION}W for {SUSTAINED_NIGHT_SEC}s")
 
-                    # ESCAPE HATCH 1: TWC shows no current = not charging = done
+                    # Decide on the live TWC measurement first, never on the cached
+                    # state.current_amps belief. (May 22 2026: EMERGENCY/external
+                    # charge left current_amps==0 while the car physically pulled
+                    # 48A; the old "Already at 0A" hatch marked complete and the car
+                    # ran to 80%.) state.current_amps is only trusted as a fallback
+                    # when TWC data is unavailable.
                     twc_amps = get_twc_current_amps()
+
+                    # HATCH 1: TWC reachable and shows no current = not charging = done.
+                    # The car is already idle, so the stop is confirmed-taken — a charge
+                    # appearing later is external (the Tesla app), to be respected below.
                     if twc_amps is not None and twc_amps < 0.5:
                         log(f"Night stop: TWC shows {twc_amps:.1f}A (no current) - marking complete")
                         state.night_stop_sent = True
+                        # First low read of the episode. Require NIGHT_CONFIRM_LOOPS
+                        # consecutive lows before trusting "idle" enough to respect a
+                        # later external charge — one transient/missing-field zero
+                        # must not latch confirmed (TWC lags ~10s; loop is 30s).
+                        state.night_zero_streak = 1
+                        state.night_stop_confirmed = (
+                            state.night_zero_streak >= NIGHT_CONFIRM_LOOPS)
 
-                    # ESCAPE HATCH 2: Already at 0A = not charging = done
+                    # PRIORITY: TWC reachable and shows real current = the car IS
+                    # charging regardless of what we believe. Send a real BLE stop.
+                    # confirmed stays False until we observe TWC actually reach ~0.
+                    elif twc_amps is not None:
+                        state.night_stop_confirmed = False
+                        state.night_zero_streak = 0  # current flowing
+                        if ble_allowed():
+                            if stop_charging():
+                                log(f"Night stop: TWC showed {twc_amps:.1f}A flowing - BLE stop succeeded")
+                                state.night_stop_sent = True
+                            else:
+                                log(f"Night stop: TWC showed {twc_amps:.1f}A flowing but BLE stop failed; will retry next loop")
+                        else:
+                            log(f"Night stop: TWC showed {twc_amps:.1f}A flowing but BLE not allowed; will retry next loop")
+
+                    # HATCH 2 (TWC unavailable): trust cached belief that we're at 0A.
+                    # Can't confirm via TWC, so leave confirmed=False (conservative:
+                    # if TWC returns and shows current, treat as a failed stop, not
+                    # as an external charge to respect).
                     elif state.current_amps == 0:
-                        log("Night stop: Already at 0A - marking complete")
+                        log("Night stop: TWC unavailable + believe 0A - marking complete")
                         state.night_stop_sent = True
+                        state.night_zero_streak = 0  # TWC unknown — not a confirmed low
 
-                    # ESCAPE HATCH 3: Fresh API data says not charging = done
+                    # HATCH 3 (TWC unavailable): fresh API data says not charging = done
                     else:
+                        state.night_zero_streak = 0  # TWC unknown — not a confirmed low
                         state_age = now_ts - state.last_status_check if state.last_status_check else 9999
                         charging_state_fresh = state_age < STATUS_CHECK_INTERVAL * 1.5
 
@@ -2127,16 +2515,40 @@ def main():
                         else:
                             log("Night stop: BLE not allowed; will retry next loop")
                 else:
-                    # Only check for drift if we thought we were charging
-                    if state.current_amps > 0:
-                        twc_amps = get_twc_current_amps()
-                        if twc_amps is not None and twc_amps > 0.5:
-                            log(f"⚠️ Night mode: TWC shows {twc_amps:.1f}A still flowing - retrying stop")
-                            state.night_stop_sent = False
-                        else:
-                            log("Night mode: idle (charging stopped)")
+                    # Stop already sent. Re-verify against the live TWC reading (not
+                    # state.current_amps) and discriminate two cases that both show
+                    # current flowing:
+                    #   - confirmed==False: we never saw TWC reach 0, so our stop
+                    #     silently failed (ble_call can return OK on an 'is_charging'
+                    #     output) -> retry the stop. This is the May 22 2026 fix.
+                    #   - confirmed==True: TWC reached 0 earlier this episode, so a
+                    #     charge now is a NEW external charge the user just started
+                    #     (the Tesla-app 'charge now') -> respect it, warn only.
+                    #     See [[project_tesla_app_workflow]].
+                    twc_amps = get_twc_current_amps()
+                    if twc_amps is None:
+                        # Unknown != idle. Break the streak (don't count toward
+                        # confirmation) but don't spam BLE while blind — assume our
+                        # stop holds.
+                        state.night_zero_streak = 0
+                        log("Night mode: idle (TWC unreachable - assuming stopped)")
+                    elif twc_amps <= 0.5:
+                        state.night_zero_streak += 1
+                        if state.night_zero_streak >= NIGHT_CONFIRM_LOOPS:
+                            state.night_stop_confirmed = True
+                        state.grid_charge_warning_amps = None
+                        log(f"Night mode: idle (not charging) "
+                            f"[zero_streak={state.night_zero_streak}, confirmed={state.night_stop_confirmed}]")
+                    elif state.night_stop_confirmed:
+                        state.night_zero_streak = 0  # current flowing
+                        log(f"Night mode: {twc_amps:.1f}A flowing after a confirmed stop "
+                            f"- external charge (user-initiated), leaving it alone")
+                        state.grid_charge_warning_amps = twc_amps
                     else:
-                        log("Night mode: idle (not charging)")
+                        state.night_zero_streak = 0  # current flowing
+                        log(f"⚠️ Night mode: TWC shows {twc_amps:.1f}A flowing, stop never "
+                            f"confirmed - retrying stop")
+                        state.night_stop_sent = False
 
                 update_dashboard_status(mode, 0, 0, state.cached_battery, excess_smooth, prod_smooth, 'Stopped')
                 time.sleep(LOOP_INTERVAL)
@@ -2149,6 +2561,8 @@ def main():
                 log("Production recovered, resetting night timer")
             state.last_low_prod_time = None
             state.night_stop_sent = False
+            state.night_stop_confirmed = False
+            state.night_zero_streak = 0
 
         # ========================================
         # 5) PERIODIC TESLA STATUS (TWC fork: 2-tuple return)
@@ -2242,6 +2656,114 @@ def main():
         sse_stale = sse_age > SSE_STALE_THRESHOLD_S
         post_stale = state.fresh_recovery_count < SSE_FRESH_RECOVERY_LOOPS
 
+        # ---- v4.0.32: SOLAR-PAUSE active — verify/hold until excess recovers ----
+        # Mirrors the NIGHT stop machinery: confirmed-stop discriminator so a
+        # user-initiated charge AFTER our confirmed stop (the Tesla app)
+        # is respected, while a stop that never confirmed keeps retrying.
+        # Resume = stopped-basis excess >= the seasonal cold-start threshold
+        # (the car is stopped, so decision_excess IS the stopped basis).
+        if state.solar_pause_active:
+            start_thr = get_solar_start_threshold()
+            # v4.0.33: track consecutive above-threshold loops so chronic SSE
+            # lag can only DELAY the release (by ~2 min), never veto it. A
+            # stale-basis release is safe: the post-stale recovery gate still
+            # holds UP-steps until 2 fresh loops, so no BLE acts on stale data.
+            if decision_excess >= start_thr:
+                state.solar_pause_release_streak += 1
+            else:
+                state.solar_pause_release_streak = 0
+            if decision_excess >= start_thr and (
+                    not sse_stale
+                    or state.solar_pause_release_streak
+                    >= SOLAR_PAUSE_STALE_RELEASE_LOOPS):
+                basis = ("stale basis, "
+                         f"{state.solar_pause_release_streak} loops sustained"
+                         if sse_stale else "stopped basis")
+                log(f"SOLAR-PAUSE: released — excess {decision_excess:.0f}W >= "
+                    f"{start_thr}W ({basis})")
+                reset_solar_pause_state()
+                # Fall through: current_amps==0, normal cold-start flow can
+                # issue first amps this loop.
+            else:
+                if twc_actual is None:
+                    # Unknown != idle. Break the streak but don't spam BLE
+                    # while blind — assume our stop holds (v4.0.31 stance).
+                    state.solar_pause_zero_streak = 0
+                    log("SOLAR-PAUSE: holding (TWC unreachable — assuming stopped)")
+                elif twc_actual <= 0.5:
+                    state.solar_pause_zero_streak += 1
+                    if state.solar_pause_zero_streak >= NIGHT_CONFIRM_LOOPS:
+                        state.solar_pause_stop_confirmed = True
+                    state.grid_charge_warning_amps = None
+                    log(f"SOLAR-PAUSE: holding — excess {decision_excess:.0f}W < "
+                        f"{start_thr}W [zero_streak={state.solar_pause_zero_streak}, "
+                        f"confirmed={state.solar_pause_stop_confirmed}]")
+                elif state.solar_pause_stop_confirmed:
+                    log(f"SOLAR-PAUSE: {twc_actual:.1f}A flowing after a confirmed "
+                        f"stop — external charge (user-initiated), releasing pause "
+                        f"+ hands off")
+                    state.grid_charge_warning_amps = twc_actual
+                    # current_amps stays 0 -> the cold-start gate keeps SOLAR
+                    # hands-off the external charge (Tesla-app guard).
+                    reset_solar_pause_state()
+                else:
+                    state.solar_pause_zero_streak = 0
+                    log(f"⚠️ SOLAR-PAUSE: TWC shows {twc_actual:.1f}A, stop never "
+                        f"confirmed — retrying stop")
+                    if ble_allowed():
+                        if stop_charging():
+                            log("SOLAR-PAUSE: retry stop succeeded")
+                        else:
+                            log("SOLAR-PAUSE: retry stop failed; will retry next loop")
+                    else:
+                        log("SOLAR-PAUSE: retry stop gated; will retry next loop")
+                update_dashboard_status(mode, 0, 0, battery, excess_smooth,
+                                        prod_smooth, charging_state or 'Stopped')
+                # Keep the standard "(mode=X, amps=N)" shape — phase2_telemetry
+                # PAT_MODE parses it; tag goes after (May 19 parser lesson).
+                log(f"Sleeping {LOOP_INTERVAL}s (mode={mode}, amps={state.current_amps}) [SOLAR-PAUSE]")
+                log(f"Loop duration: {time.time() - loop_start_ts:.1f}s")
+                time.sleep(LOOP_INTERVAL)
+                continue
+
+        # ---- v4.0.32: SOLAR-PAUSE trigger — deep sustained import at the floor ----
+        # Only fires on OUR floor pin (current_amps == MIN_AMPS). External
+        # charges run with current_amps==0 and never arm the streak.
+        if (0 < state.current_amps <= MIN_AMPS
+                and twc_actual is not None and twc_actual > 1.0
+                and not sse_stale
+                and decision_excess <= -SOLAR_PAUSE_IMPORT_W):
+            state.solar_pause_import_streak = min(
+                state.solar_pause_import_streak + 1, SOLAR_PAUSE_SUSTAIN_LOOPS)
+            if state.solar_pause_import_streak >= SOLAR_PAUSE_SUSTAIN_LOOPS:
+                if ble_allowed():
+                    log(f"SOLAR-PAUSE: import {-decision_excess:.0f}W >= "
+                        f"{SOLAR_PAUSE_IMPORT_W}W for {SOLAR_PAUSE_SUSTAIN_LOOPS} "
+                        f"loops at {MIN_AMPS}A floor — stopping charge")
+                    if stop_charging():
+                        state.solar_pause_active = True
+                        state.solar_pause_stop_confirmed = False
+                        state.solar_pause_zero_streak = 0
+                        state.solar_pause_import_streak = 0
+                        update_dashboard_status(mode, 0, 0, battery, excess_smooth,
+                                                prod_smooth, 'Stopped')
+                        log(f"Sleeping {LOOP_INTERVAL}s (mode={mode}, amps={state.current_amps}) [SOLAR-PAUSE engaged]")
+                        log(f"Loop duration: {time.time() - loop_start_ts:.1f}s")
+                        time.sleep(LOOP_INTERVAL)
+                        continue
+                    else:
+                        log("SOLAR-PAUSE: BLE stop failed; will retry next loop")
+                else:
+                    log("SOLAR-PAUSE: stop due but BLE gated; will retry next loop")
+            else:
+                log(f"SOLAR-PAUSE: deep import streak "
+                    f"{state.solar_pause_import_streak}/{SOLAR_PAUSE_SUSTAIN_LOOPS} "
+                    f"(import {-decision_excess:.0f}W at {state.current_amps}A floor)")
+        elif 0 < state.current_amps <= MIN_AMPS and sse_stale:
+            pass  # SSE stale: freeze the streak (don't accumulate, don't reset)
+        else:
+            state.solar_pause_import_streak = 0
+
         # ---- Fast-drop on real cliff (excess_smooth, not median) ----
         # excess_smooth leads median on transients because the 60s median is
         # dragged up by older healthy samples for ~30-60s after a cloud edge.
@@ -2302,9 +2824,14 @@ def main():
                     log(f"SOLAR: Car complete at {battery}% — suppressing BLE")
             elif abs(banded_target - state.current_amps) >= AMP_CHANGE_THRESHOLD:
                 # v4.0.27: switched from excess_smooth to decision_excess so
-                # the wife-Tesla-app guard lines up with the new median basis.
+                # the Tesla-app guard lines up with the new median basis.
                 # current_amps==0 sentinel preserved (project_tesla_app_workflow).
-                if decision_excess <= 0 and state.current_amps == 0:
+                # Seasonal cold-start threshold (replaces the original
+                # `decision_excess <= 0` guard): in summer require ~1.4kW
+                # excess to avoid grid-pull at the 6A floor; in winter accept
+                # any positive excess.
+                start_threshold = get_solar_start_threshold()
+                if decision_excess < start_threshold and state.current_amps == 0:
                     twc_amps = get_twc_current_amps()
                     # Only warn if TWC shows significantly more than MIN_AMPS
                     # If TWC shows ~6A, that's expected for solar mode with no excess
@@ -2317,7 +2844,8 @@ def main():
                             # TWC at low amps (~6A) - sync state to match
                             log(f"TWC shows {twc_amps:.1f}A (near MIN_AMPS) - syncing state")
                             state.current_amps = MIN_AMPS
-                    log(f"Stable target {banded_target}A but no solar excess - skipping BLE")
+                    log(f"SOLAR cold-start gated: excess={decision_excess:.0f}W "
+                        f"< {start_threshold}W (month {datetime.now().month}) - skipping BLE")
                 else:
                     # Check preconditioning inhibit (auto-detect OR dashboard flag)
                     precond_active = state.cached_is_preconditioning
@@ -2366,16 +2894,23 @@ def main():
             log("Car not charging but amps > 0 -> starting charging")
             start_charging()
 
-        # If car is Complete below target with limit already raised, restart
+        # If car is Complete below target with limit already raised, restart.
+        # Also gated by seasonal cold-start threshold — no point restarting
+        # mid-day if excess is too low to charge meaningfully.
         if (charging_state == 'Complete'
                 and battery is not None
                 and battery < DEFAULT_BATTERY_TARGET
                 and state.last_charge_limit_set is not None
                 and state.last_charge_limit_set >= DEFAULT_BATTERY_TARGET
                 and ble_allowed()):
-            log(f"SOLAR: Car Complete at {battery}% — restarting "
-                f"(limit is {state.last_charge_limit_set}%)")
-            start_charging()
+            restart_threshold = get_solar_start_threshold()
+            if decision_excess >= restart_threshold:
+                log(f"SOLAR: Car Complete at {battery}% — restarting "
+                    f"(limit is {state.last_charge_limit_set}%)")
+                start_charging()
+            else:
+                log(f"SOLAR: Car Complete at {battery}% but excess "
+                    f"{decision_excess:.0f}W < {restart_threshold}W — not restarting")
 
         if state.current_amps > 0 and charging_state == 'Charging':
             twc_amps = get_twc_current_amps()
