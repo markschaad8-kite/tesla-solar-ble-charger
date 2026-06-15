@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
+Solar Charger TWC Fork - v4.0.36-twc - Owner-api revived via TLS 1.3 pin. The 2026-06-12 403 was NOT a shutdown: Tesla classifies the client by the TLS handshake used to mint/refresh the token at auth.tesla.com, and owner-api 403s a token from the default multi-version handshake. tesla_cloud_session() pins TLS 1.3 on the teslapy session -> owner-api 200 again (verified live; matches TeslaMate v4.0.0 PR #5390). Restores cloud status + cloud wake as a working backstop to BLE-from-deep-sleep. BLE stays primary; owner-api remains officially deprecated.
 Solar Charger TWC Fork - v4.0.33-twc - SOLAR-PAUSE release no longer vetoed by chronic SSE staleness: after 4 consecutive above-threshold loops (~2 min) the pause releases even while sse_stale (post-stale UP-step gate still prevents BLE on stale data). Code-review finding from 2026-06-09 deploy night (42s envoy lag observed at dusk)
 Solar Charger TWC Fork - v4.0.32-twc - Loss-bucket fixes: MAX_AMP_STEP 4->6 (export-underuse, bucket 2) + SOLAR-PAUSE on deep sustained floor import (bucket 1, option b): BLE stop when pinned at 6A with median import >= 1500W for ~15min; resume via seasonal cold-start gate; NIGHT-style confirmed-stop discriminator respects user-initiated charges
 Solar Charger TWC Fork - v4.0.31-twc - NIGHT discriminator: respect a user-initiated charge that starts AFTER a confirmed stop (the Tesla app), keep retrying a stop that never confirmed. Hardened vs TWC latency: confirmed needs 2 consecutive TWC<=0.5 reads (debounce), and get_twc_current_amps returns None on a missing field (unknown != 0)
@@ -444,6 +445,43 @@ VIN = os.getenv("TESLA_VIN", "")
 KEY_FILE = "/app/private.pem"
 CACHE_FILE = "/app/cache.json"
 TESLA_EMAIL = os.getenv("TESLA_EMAIL", "")
+
+
+# -------------------------------
+# Tesla cloud (owner-api) session — TLS 1.3 pin (v4.0.36)
+# -------------------------------
+# Tesla's auth edge classifies the client by the TLS handshake used when the
+# token is minted/refreshed at auth.tesla.com, and owner-api enforces that class.
+# A token minted over the default multi-version handshake is refused by owner-api
+# with 403 ("forbidden, see fleet-api"); one minted over a pinned TLS 1.3
+# handshake is accepted. This was the real cause of the 2026-06-12 "owner-api
+# shutdown" — the API was never pulled, our teslapy handshake just got
+# reclassified. Forcing TLS 1.3 on the session restores cloud access (verified
+# live 2026-06-15; matches TeslaMate v4.0.0 fix PR #5390). teslapy is imported
+# inside the function intentionally (avoids startup crash on a rarely-used path).
+def tesla_cloud_session():
+    """teslapy.Tesla with TLS 1.3 pinned — required for owner-api since 2026-06-12."""
+    import ssl
+    import teslapy
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.ssl_ import create_urllib3_context
+
+    class _TLS13Adapter(HTTPAdapter):
+        def init_poolmanager(self, *args, **kwargs):
+            ctx = create_urllib3_context()
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+            kwargs['ssl_context'] = ctx
+            super().init_poolmanager(*args, **kwargs)
+
+        def proxy_manager_for(self, *args, **kwargs):
+            ctx = create_urllib3_context()
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+            kwargs['ssl_context'] = ctx
+            return super().proxy_manager_for(*args, **kwargs)
+
+    tesla = teslapy.Tesla(TESLA_EMAIL, cache_file=CACHE_FILE)
+    tesla.mount('https://', _TLS13Adapter())
+    return tesla
 
 # -------------------------------
 # NETWORK CONFIG (Stage 1 migration prep)
@@ -1257,14 +1295,14 @@ def get_tesla_status():
 
 def get_tesla_status_cloud(now=None):
     """
-    Legacy owner-api status read — STANDBY fallback only. Tesla 403'd owner-api
-    on 2026-06-12 (-> fleet-api pointer); kept in case that cutoff is reversed.
+    Owner-api status read — STANDBY fallback (BLE is primary). Tesla 403'd
+    owner-api on 2026-06-12; the TLS 1.3 pin in tesla_cloud_session() restored it
+    2026-06-15. owner-api remains officially deprecated, so this stays a fallback.
     """
     if now is None:
         now = time.time()
     try:
-        import teslapy
-        with teslapy.Tesla(TESLA_EMAIL, cache_file=CACHE_FILE) as tesla:
+        with tesla_cloud_session() as tesla:
             vehicles = tesla.vehicle_list()
             if not vehicles:
                 log("No vehicles found (teslapy)")
@@ -1355,10 +1393,10 @@ def wake_vehicle_safe(reason: str = 'manual'):
     else:
         log(f"BLE wake failed ({out[:80]}) — trying cloud fallback")
 
-    # --- 2. Legacy cloud wake (standby; 403s while owner-api is dark) ---
+    # --- 2. Cloud wake (TLS 1.3 pin restored owner-api 2026-06-15; historically
+    #         the more reliable waker than BLE-from-deep-sleep) ---
     try:
-        import teslapy
-        with teslapy.Tesla(TESLA_EMAIL, cache_file=CACHE_FILE) as tesla:
+        with tesla_cloud_session() as tesla:
             vehicles = tesla.vehicle_list()
             if not vehicles:
                 log(f"Wake failed [{reason}]: no vehicles found")
